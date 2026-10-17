@@ -11,8 +11,11 @@ import os
 import queue
 import socket
 import threading
+import time
+import logging
+import math
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk
 import pandas as pd
 
 # ---------------------------------------------------------------------------
@@ -22,6 +25,104 @@ import pandas as pd
 HOST = os.environ.get("SERVIDOR_HOST", "127.0.0.1")
 PUERTO = int(os.environ.get("SERVIDOR_PUERTO", "12345"))
 MARCA_FIN = "<EOF>"
+
+# Límites por conexión; 512 MiB permite la carga sintética de ocho columnas.
+MAX_BYTES = int(os.environ.get("SERVIDOR_MAX_BYTES", str(512 * 1024 * 1024)))
+TIEMPO_ESPERA = float(os.environ.get("SERVIDOR_TIMEOUT", "60"))
+TIEMPO_TOTAL = float(os.environ.get("SERVIDOR_TIEMPO_TOTAL", "600"))
+PASO_ESPERA = 0.2
+if MAX_BYTES <= 5 or TIEMPO_ESPERA <= 0 or TIEMPO_TOTAL <= 0:
+    raise ValueError("Configure límites positivos; SERVIDOR_MAX_BYTES debe superar cinco bytes.")
+
+
+def recibir_todo(conexion, detener=None):
+    """TCP es un flujo: esperar SHUT_WR y decodificar solo al finalizar."""
+    conexion.settimeout(PASO_ESPERA)
+    datos = bytearray()
+    inicio = avance = time.monotonic()
+    while True:
+        ahora = time.monotonic()
+        if detener is not None and detener.is_set():
+            raise ValueError("Transferencia cancelada: servidor detenido.")
+        if ahora - avance > TIEMPO_ESPERA or ahora - inicio > TIEMPO_TOTAL:
+            raise TimeoutError("Tiempo de recepción agotado.")
+        try:
+            bloque = conexion.recv(1024 * 1024)
+        except socket.timeout:
+            continue
+        if not bloque:
+            return datos
+        if len(datos) + len(bloque) > MAX_BYTES:
+            raise ValueError("El cliente superó el tamaño máximo permitido.")
+        datos.extend(bloque)
+        avance = time.monotonic()
+
+
+def decodificar(datos):
+    marca = MARCA_FIN.encode("ascii")
+    if not datos.endswith(marca):
+        raise ValueError("Falta la marca <EOF>: el envío quedó incompleto.")
+    # Solo se elimina el sufijo: las marcas dentro de valores son datos legítimos.
+    del datos[-len(marca):]
+    def constante_invalida(valor):
+        raise ValueError(f"Constante JSON no válida: {valor}")
+    def decimal_finito(valor):
+        numero = float(valor)
+        if not math.isfinite(numero):
+            raise ValueError("Número fuera del rango finito admitido.")
+        return numero
+    def objeto(pares):
+        resultado = {}
+        for clave, valor in pares:
+            if clave in resultado:
+                raise ValueError(f"Columna JSON duplicada: {clave}")
+            resultado[clave] = valor
+        return resultado
+    registros = json.loads(datos.decode("utf-8"), parse_constant=constante_invalida,
+                           parse_float=decimal_finito,
+                           object_pairs_hook=objeto)
+    if not isinstance(registros, list) or not all(isinstance(r, dict) for r in registros):
+        raise ValueError("El JSON debe ser una lista de objetos.")
+    return registros
+
+
+def dataframe_validado(registros):
+    # object conserva los enteros Python exactos junto a None; no los convierte a float.
+    return pd.DataFrame(registros, dtype=object)
+
+
+def responder(conexion, respuesta):
+    conexion.settimeout(1)
+    conexion.sendall(json.dumps(respuesta, allow_nan=False).encode("utf-8"))
+
+
+def atender(conexion, registrar=print):
+    """Adaptador histórico sin GUI, con el mismo receptor y validaciones oficiales.
+
+    Su ACK significa disponible en el resultado retornado; la GUI oficial espera
+    además la aplicación del dataset en el hilo principal.
+    """
+    registros = []
+    try:
+        registros = decodificar(recibir_todo(conexion))
+        dataframe_validado(registros)
+        resultado = {"ok": True, "filas": len(registros), "detalle": "Recepción correcta."}
+    except Exception as error:
+        resultado = {"ok": False, "filas": 0, "detalle": str(error)}
+    try:
+        responder(conexion, resultado)
+    except OSError:
+        pass
+    registrar(resultado["detalle"])
+    return {**resultado, "registros": registros if resultado["ok"] else []}
+
+
+def filtrar_dataframe(df, texto):
+    """Búsqueda literal por columna; evita una copia textual completa del dataset."""
+    mascara = pd.Series(False, index=df.index)
+    for columna in df.columns:
+        mascara |= df[columna].astype("string").str.contains(texto, case=False, regex=False, na=False)
+    return df.loc[mascara]
 
 FONDO, TARJETA, TEXTO, SUAVE = "#EEF2F5", "#FFFFFF", "#1F2A37", "#6B7785"
 ACENTO, ACENTO_OSCURO, EXITO, ERROR, AVISO = "#0E7490", "#155E75", "#15803D", "#B91C1C", "#B45309"
@@ -60,11 +161,17 @@ class ServidorBigData(tk.Tk):
         self.servidor = None
         self.detener_escucha = threading.Event()
         self.cola = queue.Queue()
+        self._cerrando = False
+        self._after_cola = None
+        self._hilo_escucha = None
+        self._hilo_cliente = None
+        self._hilo_filtro = None
+        self._version_filtro = 0
 
         self._crear_estilos()
         self._crear_widgets()
         self.protocol("WM_DELETE_WINDOW", self._cerrar)
-        self.after(100, self._revisar_cola)
+        self._after_cola = self.after(100, self._revisar_cola)
 
     def _crear_estilos(self):
         estilo = ttk.Style(self)
@@ -97,7 +204,7 @@ class ServidorBigData(tk.Tk):
         panel_red = Tarjeta(cuerpo, "Control del Servidor")
         panel_red.pack(fill="x", pady=(0, 12))
         
-        # ---> CORRECCIÓN: Creamos un sub-marco para agrupar los controles con grid <---
+        # El sub-marco permite agrupar controles con grid dentro del panel con pack.
         cont_red = ttk.Frame(panel_red, style="Tarjeta.TFrame")
         cont_red.pack(fill="x")
         
@@ -168,6 +275,8 @@ class ServidorBigData(tk.Tk):
             self.detener()
 
     def iniciar(self):
+        if self.servidor is not None or self._cerrando:
+            return
         host, texto_puerto = self.var_ip.get().strip(), self.var_puerto.get().strip()
         if not host or not texto_puerto.isdigit() or not 0 < int(texto_puerto) < 65536:
             self._mostrar_estado("● Revise la IP y el puerto (1-65535)", ERROR)
@@ -176,14 +285,16 @@ class ServidorBigData(tk.Tk):
         try:
             serv_socket = socket.create_server((host, int(texto_puerto)))
         except OSError as error:
-            self._mostrar_estado(f"● Error al abrir puerto {texto_puerto}: {error}", ERROR)
+            motivo = "el puerto ya está en uso" if error.errno in (10048, 98) else str(error)
+            self._mostrar_estado(f"● Error al abrir puerto {texto_puerto}: {motivo}", ERROR)
             return
             
         serv_socket.settimeout(0.5)
         self.servidor = serv_socket
         self.detener_escucha.clear()
         
-        threading.Thread(target=self._bucle_escucha, args=(serv_socket,), daemon=True).start()
+        self._hilo_escucha = threading.Thread(target=self._bucle_escucha, args=(serv_socket,), daemon=True)
+        self._hilo_escucha.start()
         
         self.boton_red.configure(text="Detener escucha", style="Alto.TButton")
         self._mostrar_estado(f"● Escuchando en {host}:{texto_puerto}", EXITO)
@@ -208,53 +319,75 @@ class ServidorBigData(tk.Tk):
                     continue
                 except OSError:
                     break
-                
-                self.cola.put(lambda: self._mostrar_estado(f"● Recibiendo paquete de {direccion[0]}...", AVISO))
-                
-                # Manejar al cliente en un hilo separado
-                threading.Thread(target=self._atender_cliente, args=(conexion,), daemon=True).start()
-                
+                if self.detener_escucha.is_set() or (
+                    self._hilo_cliente is not None and self._hilo_cliente.is_alive()
+                ):
+                    try:
+                        responder(conexion, {"ok": False, "filas": 0,
+                                            "detalle": "Servidor ocupado o deteniéndose; reintente."})
+                    except OSError:
+                        pass
+                    finally:
+                        conexion.close()
+                    continue
+                self.cola.put(lambda ip=direccion[0]: self._mostrar_estado(
+                    f"● Recibiendo paquete de {ip}...", AVISO))
+                self._hilo_cliente = threading.Thread(
+                    target=self._atender_cliente, args=(conexion,), daemon=True)
+                self._hilo_cliente.start()
         finally:
             servidor.close()
+            if self._hilo_cliente is not None:
+                self._hilo_cliente.join()
             self.cola.put(self._al_detenerse)
 
     def _atender_cliente(self, conexion):
-        fragmentos = []
         try:
-            conexion.settimeout(60)
-            # Leer en chunks grandes para optimizar Big Data
-            while True:
-                fragmento = conexion.recv(1024 * 1024).decode('utf-8')
-                if not fragmento:
-                    break
-                fragmentos.append(fragmento)
-                if MARCA_FIN in fragmento:
-                    break
-
-            datos_completos = "".join(fragmentos)
-            
-            if MARCA_FIN in datos_completos:
-                datos_completos = datos_completos.replace(MARCA_FIN, "")
-            
-            self.cola.put(lambda: self._mostrar_estado("● Procesando JSON en Pandas...", ACENTO))
-            
-            # Cargar a Pandas
-            lista_datos = json.loads(datos_completos)
-            df_nuevo = pd.DataFrame(lista_datos)
-            
-            # Enviar confirmación al Cliente (Contrato de Datos)
-            respuesta = {"ok": True, "filas": len(df_nuevo)}
-            conexion.sendall(json.dumps(respuesta).encode("utf-8"))
-            
-            # Pasar los datos a la GUI
-            self.cola.put(lambda: self._datos_recibidos(df_nuevo))
-            
-        except Exception as e:
-            self.cola.put(lambda: self._mostrar_estado(f"● Error en transferencia: {e}", ERROR))
+            registros = decodificar(recibir_todo(conexion, self.detener_escucha))
+            df_nuevo = dataframe_validado(registros)
+            del registros
+            aceptado = threading.Event()
+            cancelado = threading.Event()
+            decision = threading.Lock()
+            resultado = {}
+            # La decisión, su aplicación y la señal se realizan en el hilo Tk.
+            def aceptar():
+                with decision:
+                    anterior = self.df_recibido, self.df_actual, self.pagina_actual
+                    try:
+                        if cancelado.is_set() or self.detener_escucha.is_set() or self._cerrando:
+                            raise ValueError("Transferencia cancelada: servidor detenido o aceptación vencida.")
+                        self._datos_recibidos(df_nuevo)
+                        resultado.update(ok=True, filas=len(df_nuevo))
+                    except Exception as error:
+                        self.df_recibido, self.df_actual, self.pagina_actual = anterior
+                        resultado.update(ok=False, filas=0, detalle=str(error))
+                    finally:
+                        aceptado.set()
+            self.cola.put(aceptar)
+            limite = time.monotonic() + TIEMPO_ESPERA
+            while not aceptado.wait(PASO_ESPERA):
+                if self.detener_escucha.is_set() or time.monotonic() > limite:
+                    with decision:
+                        if aceptado.is_set():
+                            break
+                        cancelado.set()
+                    raise ValueError("Transferencia cancelada o tiempo de aceptación agotado.")
+            responder(conexion, resultado)
+        except Exception as error:
+            mensaje = str(error)
+            try:
+                responder(conexion, {"ok": False, "filas": 0, "detalle": mensaje})
+            except OSError:
+                pass
+            self.cola.put(lambda texto=mensaje: self._mostrar_estado(
+                f"● Error en transferencia: {texto}", ERROR))
         finally:
             conexion.close()
 
     def _datos_recibidos(self, df_nuevo):
+        self._version_filtro += 1
+        self.entry_filtro.delete(0, tk.END)
         self.df_recibido = df_nuevo
         self.df_actual = self.df_recibido
         self.pagina_actual = 0
@@ -270,9 +403,13 @@ class ServidorBigData(tk.Tk):
     # -----------------------------------------------------------------------
 
     def cargar_datos_en_tabla(self):
-        if self.df_actual is None or self.df_actual.empty:
+        if self.df_actual is None or len(self.df_actual) == 0:
             self.tabla.delete(*self.tabla.get_children())
-            self.lbl_pagina.config(text="Sin resultados.")
+            self.tabla["columns"] = [] if self.df_actual is None else list(self.df_actual.columns)
+            self.pagina_actual = 0
+            self.btn_anterior.config(state="disabled")
+            self.btn_siguiente.config(state="disabled")
+            self.lbl_pagina.config(text="Sin resultados. · 0 registros")
             return
 
         self.tabla.delete(*self.tabla.get_children())
@@ -303,8 +440,9 @@ class ServidorBigData(tk.Tk):
         self.btn_siguiente.config(state="normal" if fin < len(self.df_actual) else "disabled")
 
     def pagina_siguiente(self):
-        self.pagina_actual += 1
-        self.cargar_datos_en_tabla()
+        if self.df_actual is not None and (self.pagina_actual + 1) * self.registros_por_pagina < len(self.df_actual):
+            self.pagina_actual += 1
+            self.cargar_datos_en_tabla()
 
     def pagina_anterior(self):
         if self.pagina_actual > 0:
@@ -312,22 +450,39 @@ class ServidorBigData(tk.Tk):
             self.cargar_datos_en_tabla()
 
     def aplicar_filtro(self):
-        texto = self.entry_filtro.get().lower().strip()
-        if not texto:
+        texto = self.entry_filtro.get().strip()
+        if self.df_recibido is None or (self._hilo_filtro and self._hilo_filtro.is_alive()):
             return
-            
+        if not texto:
+            self.limpiar_filtro()
+            return
+        self._version_filtro += 1
+        version, original = self._version_filtro, self.df_recibido
         self._mostrar_estado("● Filtrando datos...", AVISO)
-        self.update_idletasks() # Forzar refresco visual
-        
-        # Filtro global en pandas convertido a string
-        mask = self.df_recibido.astype(str).apply(lambda x: x.str.lower().str.contains(texto)).any(axis=1)
-        self.df_actual = self.df_recibido[mask]
-        self.pagina_actual = 0
-        
-        self.cargar_datos_en_tabla()
-        self._mostrar_estado(f"● Filtro aplicado: {miles(len(self.df_actual))} coincidencias.", EXITO)
+        self.btn_filtrar.configure(state="disabled")
+        def calcular():
+            try:
+                filtrado = filtrar_dataframe(original, texto)
+                def aplicar():
+                    if version != self._version_filtro:
+                        return
+                    self.df_actual = filtrado
+                    self.pagina_actual = 0
+                    self.cargar_datos_en_tabla()
+                    self._mostrar_estado(f"● Filtro aplicado: {miles(len(filtrado))} coincidencias.", EXITO)
+                self.cola.put(aplicar)
+            except Exception as error:
+                self.cola.put(lambda mensaje=str(error): self._mostrar_estado(
+                    f"● Error de filtro: {mensaje}", ERROR))
+            finally:
+                self.cola.put(lambda: self.btn_filtrar.configure(state="normal"))
+        self._hilo_filtro = threading.Thread(target=calcular, daemon=True)
+        self._hilo_filtro.start()
 
     def limpiar_filtro(self):
+        self._version_filtro += 1
+        if self.df_recibido is None:
+            return
         self.entry_filtro.delete(0, tk.END)
         self.df_actual = self.df_recibido
         self.pagina_actual = 0
@@ -336,15 +491,74 @@ class ServidorBigData(tk.Tk):
 
     def _revisar_cola(self):
         try:
-            while True:
-                self.cola.get_nowait()()
-        except queue.Empty:
-            pass
-        self.after(100, self._revisar_cola)
+            # Un lote acotado evita monopolizar el bucle de eventos.
+            for _ in range(50):
+                try:
+                    tarea = self.cola.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    tarea()
+                except Exception:
+                    logging.exception("Error en tarea del servidor")
+        finally:
+            if not self._cerrando:
+                self._after_cola = self.after(100, self._revisar_cola)
 
     def _cerrar(self):
+        if self._cerrando:
+            return
+        self._cerrando = True
         self.detener_escucha.set()
-        self.destroy()
+        self._version_filtro += 1
+        if self._after_cola is not None:
+            self.after_cancel(self._after_cola)
+        self._esperar_cierre()
+
+    def _esperar_cierre(self):
+        # No bloquear Tk mientras los trabajadores observan la cancelación.
+        hilos = (self._hilo_escucha, self._hilo_cliente, self._hilo_filtro)
+        if any(h is not None and h.is_alive() for h in hilos):
+            self.after(50, self._esperar_cierre)
+        else:
+            while not self.cola.empty():
+                self.cola.get_nowait()
+            self.destroy()
+
+
+class ServidorPrueba(ServidorBigData):
+    """Adaptador de los nombres históricos usados por las pruebas de Grupo 3."""
+    def __init__(self):
+        super().__init__()
+        self.boton = self.boton_red
+        self.registro = tk.Text(self, height=3, state="disabled")
+        self.registro.pack(fill="x")
+
+    def alternar(self):
+        self.alternar_servidor()
+
+    def _atender_cliente(self, conexion):
+        # La API histórica es síncrona para el emisor: no requiere bombear Tk
+        # mientras se espera el ACK. El dashboard oficial no utiliza este camino.
+        try:
+            registros = decodificar(recibir_todo(conexion, self.detener_escucha))
+            df = dataframe_validado(registros)
+            self.cola.put(lambda: self._datos_recibidos(df))
+            responder(conexion, {"ok": True, "filas": len(df), "detalle": "Recepción correcta."})
+        except Exception as error:
+            try:
+                responder(conexion, {"ok": False, "filas": 0, "detalle": str(error)})
+            except OSError:
+                pass
+        finally:
+            conexion.close()
+
+    def _datos_recibidos(self, df_nuevo):
+        super()._datos_recibidos(df_nuevo)
+        self.registro.configure(state="normal")
+        self.registro.insert("end", f"{len(df_nuevo)} filas recibidas\n")
+        self.registro.configure(state="disabled")
+
 
 if __name__ == "__main__":
     ServidorBigData().mainloop()
