@@ -1,6 +1,7 @@
 """Pruebas del cliente. Ejecutar desde la carpeta del proyecto:  python -m pytest -q  (requiere pytest)"""
 
 import gc
+import csv
 import json
 import socket
 import sys
@@ -71,6 +72,47 @@ def test_informe_cuenta_vacios_y_duplicados(tmp_path):
     ds.cargar(ruta)
     assert "Filas: 3" in ds.informe and "b=1" in ds.informe
     assert "Filas idénticas repetidas: 1" in ds.informe
+
+
+@pytest.mark.parametrize("separador", [",", ";"])
+def test_carga_separadores_y_respeta_texto_entre_comillas(tmp_path, separador):
+    ruta = tmp_path / "datos.csv"
+    with ruta.open("w", encoding="utf-8-sig", newline="") as archivo:
+        escritor = csv.writer(archivo, delimiter=separador)
+        escritor.writerow(["nombre", "nota", "valor"])
+        escritor.writerow(["Ñuble", 'Texto con , y ; y "comillas"', 1.5])
+        escritor.writerow(["Sur", "", 2])
+    ds = Dataset()
+    ds.cargar(ruta)
+    assert list(ds.datos.columns) == ["nombre", "nota", "valor"]
+    assert ds.datos.iloc[0].tolist() == ["Ñuble", 'Texto con , y ; y "comillas"', 1.5]
+    assert pd.isna(ds.datos.iloc[1]["nota"])
+    assert len(ds.datos) == 2
+
+
+def test_csv_una_columna_sigue_siendo_valido(tmp_path):
+    ruta = tmp_path / "datos.csv"
+    ruta.write_text('nombre\n"Norte; Sur"\nCentro\n', encoding="utf-8")
+    ds = Dataset()
+    ds.cargar(ruta)
+    assert ds.datos.to_dict("list") == {"nombre": ["Norte; Sur", "Centro"]}
+
+
+@pytest.mark.parametrize("separador", [",", ";"])
+def test_campo_vacio_final_no_desplaza_las_columnas(tmp_path, separador):
+    ruta = tmp_path / "datos.csv"
+    ruta.write_text(f"nombre{separador}valor\nSur{separador}10{separador}\n", encoding="utf-8")
+    ds = Dataset()
+    ds.cargar(ruta)
+    assert ds.datos.to_dict("list") == {"nombre": ["Sur"], "valor": [10]}
+
+
+@pytest.mark.parametrize("separador", [",", ";"])
+def test_campos_extra_con_datos_se_rechazan(tmp_path, separador):
+    ruta = tmp_path / "datos.csv"
+    ruta.write_text(f"nombre{separador}valor\nSur{separador}10{separador}extra\n", encoding="utf-8")
+    with pytest.raises(ErrorArchivo):
+        Dataset().cargar(ruta)
 
 
 @pytest.mark.parametrize("contenido", ["", "a,b\n", "a, a\n1,2\n"])
