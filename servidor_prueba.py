@@ -1,4 +1,12 @@
 """
+Script para recibir datos por sockets y mostrarlos en una tabla con filtros y ordenamiento.
+Autor: Grupo 4 — Mamani, Perea, Pinedo, Vargas, Vergara.
+Licencia: solo educacional.
+Fecha creación: 16-10-2026.
+Fecha modificación: 18-10-2026.
+Modificaciones: separación de mensajes de conexión y datos, ajustes del filtro
+y ordenamiento ascendente y descendente por columna.
+
 SERVIDOR OFICIAL (Grupo 4) - Dashboard de Ingesta Big Data.
 
 Recibe el JSON masivo enviado por el Cliente, lo carga en memoria usando Pandas,
@@ -156,6 +164,7 @@ class ServidorBigData(tk.Tk):
         self.df_actual = None
         self.pagina_actual = 0
         self.registros_por_pagina = 1000
+        self._orden = None  # (columna, ascendente); solo afecta la vista.
 
         # Variables de Red y Concurrencia
         self.servidor = None
@@ -223,17 +232,23 @@ class ServidorBigData(tk.Tk):
         self.estado.pack(anchor="w", pady=(10, 0))
 
         # SECCIÓN 2: Filtros de Vista
-        panel_filtro = Tarjeta(cuerpo, "")
+        panel_filtro = Tarjeta(cuerpo, "Filtro de búsqueda")
         panel_filtro.pack(fill="x", pady=(0, 12))
+        controles = ttk.Frame(panel_filtro, style="Tarjeta.TFrame")
+        controles.pack(fill="x")
         
-        ttk.Label(panel_filtro, text="Buscar texto:", style="Suave.TLabel").pack(side="left")
-        self.entry_filtro = ttk.Entry(panel_filtro, width=40)
+        ttk.Label(controles, text="Buscar texto:", style="Suave.TLabel").pack(side="left")
+        self.entry_filtro = ttk.Entry(controles, width=25)
         self.entry_filtro.pack(side="left", padx=10)
         
-        self.btn_filtrar = ttk.Button(panel_filtro, text="Aplicar Filtro", command=self.aplicar_filtro, state="disabled")
+        self.btn_filtrar = ttk.Button(controles, text="Aplicar", command=self.aplicar_filtro, state="disabled")
         self.btn_filtrar.pack(side="left", padx=5)
-        self.btn_limpiar = ttk.Button(panel_filtro, text="Limpiar Filtro", command=self.limpiar_filtro, state="disabled")
+        self.btn_limpiar = ttk.Button(controles, text="Limpiar", command=self.limpiar_filtro, state="disabled")
         self.btn_limpiar.pack(side="left", padx=5)
+        self.estado_datos = tk.Label(controles, text="Esperando datos...", bg=TARJETA,
+                                     fg=SUAVE, anchor="w", justify="left", font=(FUENTE, 10, "bold"))
+        self.estado_datos.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        self.estado_datos.bind("<Configure>", lambda e: self.estado_datos.configure(wraplength=max(1, e.width)))
 
         # SECCIÓN 3: Paginación
         panel_pag = ttk.Frame(cuerpo, style="Fondo.TFrame")
@@ -267,6 +282,9 @@ class ServidorBigData(tk.Tk):
 
     def _mostrar_estado(self, texto, color):
         self.estado.configure(text=texto, fg=color)
+
+    def _mostrar_estado_datos(self, texto, color):
+        self.estado_datos.configure(text=texto, fg=color)
 
     def alternar_servidor(self):
         if self.servidor is None:
@@ -358,6 +376,7 @@ class ServidorBigData(tk.Tk):
                         if cancelado.is_set() or self.detener_escucha.is_set() or self._cerrando:
                             raise ValueError("Transferencia cancelada: servidor detenido o aceptación vencida.")
                         self._datos_recibidos(df_nuevo)
+                        self._mostrar_estado("● Recepción completada. Servidor a la escucha.", EXITO)
                         resultado.update(ok=True, filas=len(df_nuevo))
                     except Exception as error:
                         self.df_recibido, self.df_actual, self.pagina_actual = anterior
@@ -387,6 +406,7 @@ class ServidorBigData(tk.Tk):
 
     def _datos_recibidos(self, df_nuevo):
         self._version_filtro += 1
+        self._orden = None
         self.entry_filtro.delete(0, tk.END)
         self.df_recibido = df_nuevo
         self.df_actual = self.df_recibido
@@ -394,7 +414,7 @@ class ServidorBigData(tk.Tk):
         
         self.cargar_datos_en_tabla()
         
-        self._mostrar_estado(f"● ¡Datos listos! {miles(len(self.df_recibido))} registros en memoria.", EXITO)
+        self._mostrar_estado_datos(f"● Datos recibidos: {miles(len(self.df_recibido))} registros.", EXITO)
         self.btn_filtrar.configure(state="normal")
         self.btn_limpiar.configure(state="normal")
 
@@ -403,24 +423,22 @@ class ServidorBigData(tk.Tk):
     # -----------------------------------------------------------------------
 
     def cargar_datos_en_tabla(self):
+        self.tabla.delete(*self.tabla.get_children())
+        columnas = [] if self.df_actual is None else list(self.df_actual.columns)
+        self.tabla["columns"] = columnas
+        for col in columnas:
+            flecha = ""
+            if self._orden and self._orden[0] == col:
+                flecha = " ▲" if self._orden[1] else " ▼"
+            self.tabla.heading(col, text=col + flecha, command=lambda columna=col: self.ordenar_columna(columna))
+            self.tabla.column(col, width=120, minwidth=80, anchor="center")
         if self.df_actual is None or len(self.df_actual) == 0:
-            self.tabla.delete(*self.tabla.get_children())
-            self.tabla["columns"] = [] if self.df_actual is None else list(self.df_actual.columns)
             self.pagina_actual = 0
             self.btn_anterior.config(state="disabled")
             self.btn_siguiente.config(state="disabled")
             self.lbl_pagina.config(text="Sin resultados. · 0 registros")
             return
 
-        self.tabla.delete(*self.tabla.get_children())
-        
-        columnas = list(self.df_actual.columns)
-        self.tabla["columns"] = columnas
-        
-        for col in columnas:
-            self.tabla.heading(col, text=col)
-            self.tabla.column(col, width=120, minwidth=80, anchor="center")
-            
         # Calcular Slices para Paginación
         inicio = self.pagina_actual * self.registros_por_pagina
         fin = inicio + self.registros_por_pagina
@@ -456,30 +474,58 @@ class ServidorBigData(tk.Tk):
         if not texto:
             self.limpiar_filtro()
             return
-        self._version_filtro += 1
-        version, original = self._version_filtro, self.df_recibido
-        self._mostrar_estado("● Filtrando datos...", AVISO)
-        self.btn_filtrar.configure(state="disabled")
-        def calcular():
+        original = self.df_recibido
+        self._calcular_vista(lambda: filtrar_dataframe(original, texto),
+                             "Filtrando datos...", "Filtro aplicado: {filas} coincidencias.")
+
+    def ordenar_columna(self, columna):
+        if self.df_actual is None or columna not in self.df_actual.columns:
+            return
+        ascendente = not self._orden[1] if self._orden and self._orden[0] == columna else True
+        original = self.df_actual
+        def ordenar():
             try:
-                filtrado = filtrar_dataframe(original, texto)
+                return original.sort_values(columna, ascending=ascendente, kind="stable", na_position="last")
+            except TypeError:
+                # Una columna con tipos mezclados se compara como texto; los vacíos quedan al final.
+                return original.sort_values(columna, ascending=ascendente, kind="stable",
+                                            na_position="last", key=lambda serie: serie.astype("string"))
+        sentido = "ascendente" if ascendente else "descendente"
+        self._calcular_vista(ordenar, "Ordenando datos...",
+                             f"Orden {sentido}: {columna}.", (columna, ascendente))
+
+    def _calcular_vista(self, calcular, mensaje, resultado, orden=None):
+        """Filtro y orden comparten un trabajador; solo Tk aplica el resultado vigente."""
+        if self._hilo_filtro and self._hilo_filtro.is_alive():
+            return
+        self._version_filtro += 1
+        version = self._version_filtro
+        self._mostrar_estado_datos(mensaje, AVISO)
+        self.btn_filtrar.configure(state="disabled")
+        def trabajo():
+            try:
+                nuevo = calcular()
                 def aplicar():
                     if version != self._version_filtro:
                         return
-                    self.df_actual = filtrado
+                    self.df_actual = nuevo
+                    self._orden = orden
                     self.pagina_actual = 0
                     self.cargar_datos_en_tabla()
-                    self._mostrar_estado(f"● Filtro aplicado: {miles(len(filtrado))} coincidencias.", EXITO)
+                    self._mostrar_estado_datos(resultado.replace("{filas}", miles(len(nuevo))), EXITO)
                 self.cola.put(aplicar)
             except Exception as error:
-                self.cola.put(lambda mensaje=str(error): self._mostrar_estado(
-                    f"● Error de filtro: {mensaje}", ERROR))
+                def fallar(texto=str(error)):
+                    if version == self._version_filtro:
+                        self._mostrar_estado_datos(f"Error al actualizar la vista: {texto}", ERROR)
+                self.cola.put(fallar)
             finally:
                 self.cola.put(lambda: self.btn_filtrar.configure(state="normal"))
-        self._hilo_filtro = threading.Thread(target=calcular, daemon=True)
+        self._hilo_filtro = threading.Thread(target=trabajo, daemon=True)
         self._hilo_filtro.start()
 
     def limpiar_filtro(self):
+        self._orden = None
         self._version_filtro += 1
         if self.df_recibido is None:
             return
@@ -487,7 +533,7 @@ class ServidorBigData(tk.Tk):
         self.df_actual = self.df_recibido
         self.pagina_actual = 0
         self.cargar_datos_en_tabla()
-        self._mostrar_estado(f"● Mostrando dataset completo: {miles(len(self.df_actual))} registros.", EXITO)
+        self._mostrar_estado_datos(f"● Mostrando dataset completo: {miles(len(self.df_actual))} registros.", EXITO)
 
     def _revisar_cola(self):
         try:
