@@ -308,7 +308,7 @@ def test_paginacion_filtros_y_dataset_vacio(ventana):
         ventana.entry_filtro.delete(0, "end")
         ventana.entry_filtro.insert(0, texto)
         ventana.aplicar_filtro()
-        esperar(ventana, lambda: "Filtro aplicado" in ventana.estado.cget("text"))
+        esperar(ventana, lambda: "Filtro aplicado" in ventana.estado_datos.cget("text"))
         assert len(ventana.df_actual) == cantidad
         assert ventana.pagina_actual == 0
         if not cantidad:
@@ -388,7 +388,7 @@ def test_carga_masiva_sintetica(ventana, monkeypatch):
     ventana.after(1, lambda: latidos.append(True))
     inicio_filtro = time.perf_counter()
     ventana.aplicar_filtro()
-    esperar(ventana, lambda: "Filtro aplicado" in ventana.estado.cget("text"), 30)
+    esperar(ventana, lambda: "Filtro aplicado" in ventana.estado_datos.cget("text"), 30)
     assert latidos and len(ventana.df_actual) == n
     assert len(ventana.tabla.get_children()) == 1000
     print(f"Filtro masivo literal: segundos={time.perf_counter()-inicio_filtro:.3f}, coincidencias={len(ventana.df_actual)}, latido_Tk={bool(latidos)}")
@@ -404,3 +404,103 @@ def test_dataset_real_si_disponible(ventana):
     puerto = iniciar(ventana)
     ack = terminar(ventana, en_hilo(lambda: EmisorTCP().enviar(ds.datos, "127.0.0.1", puerto, 5000)))
     assert ack == {"ok": True, "filas": 569250}
+
+
+def test_estados_conexion_y_datos_separados(ventana):
+    ventana._mostrar_estado("Servidor detenido", s.SUAVE)
+    ventana._datos_recibidos(pd.DataFrame({"zona": ["Sur", "Norte"]}))
+    assert ventana.estado.cget("text") == "Servidor detenido"
+    assert "2" in ventana.estado_datos.cget("text")
+    ventana.entry_filtro.insert(0, "Sur")
+    ventana.aplicar_filtro()
+    esperar(ventana, lambda: "Filtro aplicado" in ventana.estado_datos.cget("text"))
+    assert ventana.estado.cget("text") == "Servidor detenido"
+    assert len(ventana.df_actual) == 1
+    ventana.limpiar_filtro()
+    assert ventana.estado.cget("text") == "Servidor detenido"
+    assert len(ventana.df_actual) == 2
+
+
+def test_ordenar_encabezado_abarca_paginas_y_alterna(ventana):
+    original = pd.DataFrame({"valor": [10, 2, None, 1], "zona": ["Sur"] * 4}, dtype=object)
+    ventana.registros_por_pagina = 2
+    ventana._datos_recibidos(original)
+    # Ejecutar el comando real del encabezado, como un clic del usuario.
+    ventana.tk.call(ventana.tabla.heading("valor", "command"))
+    esperar(ventana, lambda: "ascendente" in ventana.estado_datos.cget("text"))
+    assert ventana.df_actual["valor"].tolist() == [1, 2, 10, None]
+    ventana.pagina_siguiente()
+    assert ventana.tabla.item(ventana.tabla.get_children()[0], "values")[0] == "10"
+    ventana.tk.call(ventana.tabla.heading("valor", "command"))
+    esperar(ventana, lambda: "descendente" in ventana.estado_datos.cget("text"))
+    assert ventana.df_actual["valor"].tolist() == [10, 2, 1, None]
+    assert ventana.pagina_actual == 0
+    assert original["valor"].tolist() == [10, 2, None, 1]
+
+
+def test_ordenar_texto_filtrado_y_reiniciar_con_nuevas_columnas(ventana):
+    ventana._datos_recibidos(pd.DataFrame({"nombre": ["Zeta", "Alfa", "Beta"], "zona": ["Sur", "Sur", "Norte"]}))
+    ventana.entry_filtro.insert(0, "Sur")
+    ventana.aplicar_filtro()
+    esperar(ventana, lambda: "Filtro aplicado" in ventana.estado_datos.cget("text"))
+    ventana.ordenar_columna("nombre")
+    esperar(ventana, lambda: "ascendente" in ventana.estado_datos.cget("text"))
+    assert ventana.df_actual["nombre"].tolist() == ["Alfa", "Zeta"]
+    ventana.limpiar_filtro()
+    assert ventana.df_actual["nombre"].tolist() == ["Zeta", "Alfa", "Beta"]
+    assert ventana.tabla.heading("nombre", "text") == "nombre"
+    ventana._datos_recibidos(pd.DataFrame({"nuevo": [2, 1]}))
+    assert list(ventana.tabla["columns"]) == ["nuevo"]
+    ventana.ordenar_columna("nuevo")
+    esperar(ventana, lambda: "ascendente" in ventana.estado_datos.cget("text"))
+    assert ventana.df_actual["nuevo"].tolist() == [1, 2]
+
+
+def test_filtro_sin_resultados_conserva_encabezados(ventana):
+    ventana._datos_recibidos(pd.DataFrame({"nombre": ["Sur"]}))
+    ventana.entry_filtro.insert(0, "inexistente")
+    ventana.aplicar_filtro()
+    esperar(ventana, lambda: "Filtro aplicado" in ventana.estado_datos.cget("text"))
+    assert ventana.tabla.heading("nombre", "text") == "nombre"
+    assert not ventana.tabla.get_children()
+
+
+def test_orden_mixto_y_error_se_muestran_solo_en_datos(ventana, monkeypatch):
+    ventana._mostrar_estado("Servidor detenido", s.SUAVE)
+    ventana._datos_recibidos(pd.DataFrame({"dato": [2, "texto", None]}, dtype=object))
+    ventana.ordenar_columna("dato")
+    esperar(ventana, lambda: "ascendente" in ventana.estado_datos.cget("text"))
+    assert ventana.df_actual["dato"].tolist() == [2, "texto", None]
+    def fallar(df, texto):
+        raise ValueError("fallo de prueba")
+    monkeypatch.setattr(s, "filtrar_dataframe", fallar)
+    ventana.entry_filtro.insert(0, "x")
+    ventana.aplicar_filtro()
+    esperar(ventana, lambda: "fallo de prueba" in ventana.estado_datos.cget("text"))
+    assert ventana.estado.cget("text") == "Servidor detenido"
+    assert str(ventana.btn_filtrar.cget("state")) == "normal"
+
+
+def test_orden_pendiente_no_reemplaza_dataset_nuevo(ventana, monkeypatch):
+    inicio, continuar = threading.Event(), threading.Event()
+    ordenar = pd.DataFrame.sort_values
+    def lento(df, *args, **kwargs):
+        inicio.set()
+        assert continuar.wait(5)
+        return ordenar(df, *args, **kwargs)
+    monkeypatch.setattr(pd.DataFrame, "sort_values", lento)
+    ventana._datos_recibidos(pd.DataFrame({"viejo": [2, 1]}))
+    ventana.ordenar_columna("viejo")
+    try:
+        esperar(ventana, inicio.is_set)
+        latido = []
+        ventana.after(1, lambda: latido.append(True))
+        esperar(ventana, lambda: bool(latido))
+        nuevo = pd.DataFrame({"nuevo": [3]})
+        ventana._datos_recibidos(nuevo)
+    finally:
+        continuar.set()
+    esperar(ventana, lambda: not ventana._hilo_filtro.is_alive())
+    esperar(ventana, lambda: ventana.cola.empty())
+    assert ventana.df_actual is nuevo
+    assert ventana.tabla.heading("nuevo", "text") == "nuevo"

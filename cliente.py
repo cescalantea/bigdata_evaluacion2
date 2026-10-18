@@ -24,6 +24,7 @@ Requisitos: Python 3.10+ con pandas instalado (pip install pandas).
 Ejecutar:  python cliente.py
 """
 
+import csv
 import json
 import math
 import os
@@ -32,6 +33,7 @@ import socket
 import threading
 import time
 import tkinter as tk
+import warnings
 from tkinter import filedialog, ttk
 
 import pandas as pd
@@ -95,7 +97,20 @@ class Dataset:
     # Propósito: leer el CSV y preparar el informe. Lanza ErrorArchivo si no sirve.
     def cargar(self, ruta):
         try:
-            datos = pd.read_csv(ruta, encoding="utf-8-sig")
+            with open(ruta, encoding="utf-8-sig", newline="") as archivo:
+                encabezado = next((linea for linea in archivo if linea.strip()), "")
+            # Detectar solo los dos separadores admitidos; una columna usa coma por defecto.
+            try:
+                separador = csv.Sniffer().sniff(encabezado, delimiters=",;").delimiter
+            except csv.Error:
+                separador = ","
+            # Evitar que pandas use la primera columna como índice ante un campo final vacío.
+            # Si sobran datos reales, rechazar la carga en vez de descartarlos silenciosamente.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", pd.errors.ParserWarning)
+                datos = pd.read_csv(ruta, encoding="utf-8-sig", sep=separador, index_col=False)
+        except pd.errors.ParserWarning as error:
+            raise ErrorArchivo("Hay filas con más datos que columnas. Revise el separador y los encabezados.") from error
         except (OSError, UnicodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as error:
             raise ErrorArchivo(f"No se pudo leer el CSV: {error}") from error
         datos.columns = [str(c).strip() for c in datos.columns]
