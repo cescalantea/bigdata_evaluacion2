@@ -411,3 +411,19 @@ def test_ventana_cancelar_envio_deja_todo_listo_para_reintentar(ventana_cliente,
     assert v.emisor is None
     assert str(v.boton_enviar.cget("state")) == "normal"
     assert str(v.boton_cancelar.cget("state")) == "disabled"
+
+
+# Propósito: un fallo de red (servidor apagado) debe verse en pantalla, sin excepciones en Tkinter.
+def test_ventana_muestra_el_error_si_no_hay_servidor(ventana_cliente):
+    v = ventana_cliente
+    libre = socket.create_server(("127.0.0.1", 0))
+    puerto = libre.getsockname()[1]
+    libre.close()
+    v.var_puerto.set(str(puerto))
+    errores = []
+    v.report_callback_exception = lambda *info: errores.append(info)
+    v.enviar()
+    assert esperar(v, lambda: v.etiqueta_envio.cget("text").startswith("✖"), 8)
+    assert "No hay un servidor" in v.etiqueta_envio.cget("text")
+    assert errores == []
+    assert str(v.boton_enviar.cget("state")) == "normal"

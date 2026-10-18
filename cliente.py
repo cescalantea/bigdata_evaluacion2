@@ -576,7 +576,9 @@ class VentanaCliente(tk.Tk):
         except EnvioCancelado:
             self.cola.put(self._al_cancelar)
         except ErrorCliente as error:
-            self.cola.put(lambda: self._al_fallar_envio(str(error)))
+            # Python borra "error" al salir del except; se guarda el texto antes de que la lambda corra.
+            mensaje = str(error)
+            self.cola.put(lambda: self._al_fallar_envio(mensaje))
 
     # Propósito: dejar la pantalla lista para intentar de nuevo (se llama al terminar un envío).
     def _terminar_envio(self):
