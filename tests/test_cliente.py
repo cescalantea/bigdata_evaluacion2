@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import messagebox
 from pathlib import Path
 
 import pandas as pd
@@ -427,3 +428,35 @@ def test_ventana_muestra_el_error_si_no_hay_servidor(ventana_cliente):
     assert "No hay un servidor" in v.etiqueta_envio.cget("text")
     assert errores == []
     assert str(v.boton_enviar.cget("state")) == "normal"
+
+
+@pytest.mark.parametrize("tipo", ["formato_no_csv", "vacio", "inexistente"])
+def test_error_carga_recupera_gui_y_permite_otro_csv(ventana_cliente, tmp_path,
+                                                  csv_chico, monkeypatch, tipo):
+    v = ventana_cliente
+    anterior = v.dataset
+    ruta = tmp_path / ("archivo.bin" if tipo == "formato_no_csv" else "archivo.csv")
+    if tipo == "formato_no_csv":
+        # Contenido binario que no se puede interpretar como un CSV UTF-8.
+        ruta.write_bytes(b"\x00\xff\xfe\x80\x81")
+    elif tipo == "vacio":
+        ruta.write_text("")
+    alertas, errores = [], []
+    monkeypatch.setattr(messagebox, "showerror", lambda titulo, texto, **kw: alertas.append(texto))
+    v.report_callback_exception = lambda *info: errores.append(info)
+    monkeypatch.setattr("cliente.filedialog.askopenfilename", lambda **kw: str(ruta))
+    v.elegir_csv()
+    assert esperar(v, lambda: str(v.boton_cargar.cget("state")) == "normal" or bool(errores))
+    assert errores == []
+    assert alertas == []  # Los errores se muestran en la ventana, sin diálogo modal.
+    assert "CSV" in v.texto_informe.get("1.0", "end")
+    assert str(v.texto_informe.cget("foreground")) == "#B91C1C"
+    assert v.dataset is anterior
+    assert str(v.boton_cargar.cget("state")) == "normal"
+    assert str(v.boton_enviar.cget("state")) == "normal"
+    assert not v.barra_carga.winfo_manager()
+    monkeypatch.setattr("cliente.filedialog.askopenfilename", lambda **kw: str(csv_chico))
+    v.elegir_csv()
+    assert esperar(v, lambda: v.dataset is not anterior)
+    assert len(v.dataset.datos) == 4
+    assert str(v.texto_informe.cget("foreground")) == "#1F2A37"

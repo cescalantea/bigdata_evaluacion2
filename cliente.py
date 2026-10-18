@@ -434,8 +434,8 @@ class VentanaCliente(tk.Tk):
         self.tabla.pack(side="left", fill="both", expand=True)
 
     # Propósito: reemplazar el texto del informe (la caja está bloqueada, se desbloquea un instante).
-    def _escribir_informe(self, texto):
-        self.texto_informe.configure(state="normal")
+    def _escribir_informe(self, texto, color=TEXTO):
+        self.texto_informe.configure(state="normal", foreground=color)
         self.texto_informe.delete("1.0", "end")
         self.texto_informe.insert("1.0", texto)
         self.texto_informe.configure(state="disabled")
@@ -468,7 +468,9 @@ class VentanaCliente(tk.Tk):
             nuevo.cargar(ruta)
             self.cola.put(lambda: self._al_cargar(nuevo))
         except ErrorCliente as error:
-            self.cola.put(lambda: self._al_fallar_carga(str(error)))
+            # Python elimina "error" al salir del except; conservar el texto para la GUI.
+            mensaje = str(error)
+            self.cola.put(lambda: self._al_fallar_carga(mensaje))
 
     def _al_cargar(self, nuevo):
         self.dataset, self.cargado = nuevo, True
@@ -484,7 +486,9 @@ class VentanaCliente(tk.Tk):
     def _al_fallar_carga(self, texto):
         self.barra_carga.stop()
         self.barra_carga.pack_forget()
-        self._escribir_informe(f"⚠ {texto}")
+        self._escribir_informe(
+            f"✖ {texto}\n\nSeleccione un CSV válido, con registros y codificación UTF-8. "
+            "Si el archivo está en otro formato, exporte los datos a CSV antes de cargarlo.", color=ERROR)
         self._bloquear(False)
 
     # --- Paso 3: columnas (se crean según el CSV cargado) ---------------------
