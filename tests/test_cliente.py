@@ -502,3 +502,18 @@ def test_error_carga_recupera_gui_y_permite_otro_csv(ventana_cliente, tmp_path,
     assert esperar(v, lambda: v.dataset is not anterior)
     assert len(v.dataset.datos) == 4
     assert str(v.texto_informe.cget("foreground")) == "#1F2A37"
+
+
+# Propósito: la duración se muestra en formato legible.
+@pytest.mark.parametrize("segundos, esperado", [(0.84, "0,8 s"), (12.44, "12,4 s"), (125, "2 min 05 s")])
+def test_formatear_duracion(segundos, esperado):
+    from cliente import formatear_duracion
+    assert formatear_duracion(segundos) == esperado
+
+
+# Propósito: tras un envío exitoso la pantalla informa la demora.
+def test_ventana_muestra_la_demora_del_envio(ventana_cliente):
+    v = ventana_cliente
+    v._al_enviar(10, {"ok": True, "filas": 10}, 2.5)
+    texto = v.etiqueta_envio.cget("text")
+    assert "Demora: 2,5 s" in texto and "4 filas/s" in texto

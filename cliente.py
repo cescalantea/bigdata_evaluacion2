@@ -1,26 +1,26 @@
 """
-CLIENTE (Grupo 3) - Envío de un CSV cualquiera a un servidor por sockets TCP.
+CLIENTE (Grupo 3) - Envío de un CSV a un servidor por sockets TCP.
 
-Flujo (cuatro pasos, igual que en la pantalla):
-    1. Cargar un CSV.               -> recién ahí aparecen sus columnas.
-    2. Revisión del archivo.        -> informe de calidad.
-    3. Elegir columnas a enviar.    -> una casilla por columna del CSV.
-    4. Enviar al servidor.          -> por lotes, con barra de progreso.
+Autores:
+- Escalante, Camilo.
+- Jara, Danilo.
+- López, Matías.
+- Ruiz, Fransheska.
+- Soto, Marcelo.
 
-Contrato con el servidor (el mismo del demo del Grupo 4):
-    - El cliente envía UN arreglo JSON de registros, por ejemplo [{"a":1},{"a":2}]
-    - Al final agrega la marca <EOF> y cierra su lado de la conexión.
-    - El servidor lee hasta que la conexión se cierra.
-    - (Opcional) El servidor puede responder una línea JSON: {"ok": true, "filas": N}
+Licencia: solo educacional.
 
-Clases:
-    ErrorCliente    -> excepción base; ErrorArchivo y ErrorRed heredan de ella.
-    Dataset         -> guarda el CSV cargado, lo revisa y entrega las columnas elegidas.
-    EmisorTCP       -> abre el socket y envía los lotes.
-    Tarjeta         -> panel visual reutilizable (hereda de ttk.Frame).
-    VentanaCliente  -> la GUI (hereda de tk.Tk); solo une las piezas anteriores.
+Flujo:
+1. Cargar un CSV.  
+2. Revisión del archivo.
+3. Elegir columnas a enviar. 
+4. Enviar al servidor.
+
+Apoyado con IA (Claude Opus 5.5)
+Propósito: Optimizar funciones de envío y mejorar la interfaz gráfica para una mejor experiencia de usuario.
 
 Requisitos: Python 3.10+ con pandas instalado (pip install pandas).
+
 Ejecutar:  python cliente.py
 """
 
@@ -78,6 +78,14 @@ class EnvioCancelado(ErrorCliente):
 # Propósito: mostrar 569250 como 569.250 (formato chileno).
 def miles(numero):
     return f"{numero:,}".replace(",", ".")
+
+
+# Propósito: mostrar segundos de forma legible: 0,8 s, 12,4 s o 2 min 05 s.
+def formatear_duracion(segundos):
+    if segundos < 60:
+        return f"{segundos:.1f} s".replace(".", ",")
+    minutos, resto = divmod(round(segundos), 60)
+    return f"{minutos} min {resto:02d} s"
 
 
 # ---------------------------------------------------------------------------
@@ -588,10 +596,12 @@ class VentanaCliente(tk.Tk):
     # Propósito: (hilo) enviar y dejar el avance y el resultado en la cola.
     def _tarea_enviar(self, emisor, datos, host, puerto, tam_lote):
         try:
+            inicio = time.monotonic()   # el reloj corre desde que se intenta conectar hasta la respuesta
             respuesta = emisor.enviar(
                 datos, host, puerto, tam_lote,
                 lambda actual, total: self.cola.put(lambda: self._al_progresar(actual, total)))
-            self.cola.put(lambda: self._al_enviar(len(datos), respuesta))
+            duracion = time.monotonic() - inicio
+            self.cola.put(lambda: self._al_enviar(len(datos), respuesta, duracion))
         except EnvioCancelado:
             self.cola.put(self._al_cancelar)
         except ErrorCliente as error:
@@ -609,13 +619,15 @@ class VentanaCliente(tk.Tk):
         self.barra_envio.configure(maximum=total, value=actual)
         self.etiqueta_envio.configure(text=f"Enviando lote {actual} de {total}…", foreground=SUAVE)
 
-    def _al_enviar(self, filas, respuesta):
+    # Propósito: mostrar el resultado del envío junto con lo que demoró (tiempo total y filas por segundo).
+    def _al_enviar(self, filas, respuesta, duracion):
         self._terminar_envio()
+        tiempo = f"Demora: {formatear_duracion(duracion)} ({miles(int(filas / max(duracion, 0.001)))} filas/s)."
         if respuesta is None:
-            texto = f"✔ {miles(filas)} filas enviadas. El servidor no devolvió confirmación."
+            texto = f"✔ {miles(filas)} filas enviadas. El servidor no devolvió confirmación. {tiempo}"
             color = EXITO
         elif respuesta.get("ok") and respuesta.get("filas") == filas:
-            texto = f"✔ El servidor confirmó la recepción de {miles(filas)} filas."
+            texto = f"✔ El servidor confirmó la recepción de {miles(filas)} filas. {tiempo}"
             color = EXITO
         else:
             texto = f"✖ Respuesta inesperada del servidor: {respuesta}"
