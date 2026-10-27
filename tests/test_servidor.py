@@ -186,7 +186,7 @@ def test_ack_negativo_cliente_y_recuperacion(ventana):
     v = VentanaCliente()
     v.withdraw()
     try:
-        v._al_enviar(1, respuesta)
+        v._al_enviar(1, respuesta, 0.1)
         assert "Respuesta inesperada" in v.etiqueta_envio.cget("text")
     finally:
         for identificador in v.tk.call("after", "info"):
