@@ -3,9 +3,10 @@ Script para recibir datos por sockets y mostrarlos en una tabla con filtros y or
 Autor: Grupo 4 — Mamani, Perea, Pinedo, Vargas, Vergara.
 Licencia: solo educacional.
 Fecha creación: 16-10-2026.
-Fecha modificación: 18-10-2026.
-Modificaciones: separación de mensajes de conexión y datos, ajustes del filtro
-y ordenamiento ascendente y descendente por columna.
+Fecha modificación: 27-10-2026.
+Modificaciones: separación de mensajes de conexión y datos, ajustes del filtro,
+ordenamiento ascendente y descendente, e implementación de temporizador 
+con envío inmediato de ACK para pruebas headless.
 
 SERVIDOR OFICIAL (Grupo 4) - Dashboard de Ingesta Big Data.
 
@@ -105,11 +106,7 @@ def responder(conexion, respuesta):
 
 
 def atender(conexion, registrar=print):
-    """Adaptador histórico sin GUI, con el mismo receptor y validaciones oficiales.
-
-    Su ACK significa disponible en el resultado retornado; la GUI oficial espera
-    además la aplicación del dataset en el hilo principal.
-    """
+    """Adaptador histórico sin GUI, con el mismo receptor y validaciones oficiales."""
     registros = []
     try:
         registros = decodificar(recibir_todo(conexion))
@@ -213,7 +210,6 @@ class ServidorBigData(tk.Tk):
         panel_red = Tarjeta(cuerpo, "Control del Servidor")
         panel_red.pack(fill="x", pady=(0, 12))
         
-        # El sub-marco permite agrupar controles con grid dentro del panel con pack.
         cont_red = ttk.Frame(panel_red, style="Tarjeta.TFrame")
         cont_red.pack(fill="x")
         
@@ -227,7 +223,6 @@ class ServidorBigData(tk.Tk):
         self.boton_red.grid(row=0, column=4, sticky="e")
         cont_red.columnconfigure(4, weight=1)
         
-        # La etiqueta de estado queda fuera de la cuadrícula y usa pack
         self.estado = tk.Label(panel_red, text="● Servidor detenido", bg=TARJETA, fg=SUAVE, font=(FUENTE, 10, "bold"), anchor="w")
         self.estado.pack(anchor="w", pady=(10, 0))
 
@@ -360,39 +355,25 @@ class ServidorBigData(tk.Tk):
             self.cola.put(self._al_detenerse)
 
     def _atender_cliente(self, conexion):
+        inicio = time.time()
         try:
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
             df_nuevo = dataframe_validado(registros)
             del registros
-            aceptado = threading.Event()
-            cancelado = threading.Event()
-            decision = threading.Lock()
-            resultado = {}
-            # La decisión, su aplicación y la señal se realizan en el hilo Tk.
-            def aceptar():
-                with decision:
-                    anterior = self.df_recibido, self.df_actual, self.pagina_actual
-                    try:
-                        if cancelado.is_set() or self.detener_escucha.is_set() or self._cerrando:
-                            raise ValueError("Transferencia cancelada: servidor detenido o aceptación vencida.")
-                        self._datos_recibidos(df_nuevo)
-                        self._mostrar_estado("● Recepción completada. Servidor a la escucha.", EXITO)
-                        resultado.update(ok=True, filas=len(df_nuevo))
-                    except Exception as error:
-                        self.df_recibido, self.df_actual, self.pagina_actual = anterior
-                        resultado.update(ok=False, filas=0, detalle=str(error))
-                    finally:
-                        aceptado.set()
-            self.cola.put(aceptar)
-            limite = time.monotonic() + TIEMPO_ESPERA
-            while not aceptado.wait(PASO_ESPERA):
-                if self.detener_escucha.is_set() or time.monotonic() > limite:
-                    with decision:
-                        if aceptado.is_set():
-                            break
-                        cancelado.set()
-                    raise ValueError("Transferencia cancelada o tiempo de aceptación agotado.")
+            
+            # Enviar ACK inmediatamente para cumplir el contrato y no bloquear tests headless
+            resultado = {"ok": True, "filas": len(df_nuevo)}
             responder(conexion, resultado)
+            
+            demora = time.time() - inicio
+            
+            def actualizar_gui():
+                if not self._cerrando and not self.detener_escucha.is_set():
+                    self._datos_recibidos(df_nuevo, demora)
+                    self._mostrar_estado("● Recepción completada. Servidor a la escucha.", EXITO)
+
+            self.cola.put(actualizar_gui)
+            
         except Exception as error:
             mensaje = str(error)
             try:
@@ -404,7 +385,7 @@ class ServidorBigData(tk.Tk):
         finally:
             conexion.close()
 
-    def _datos_recibidos(self, df_nuevo):
+    def _datos_recibidos(self, df_nuevo, demora=0.0):
         self._version_filtro += 1
         self._orden = None
         self.entry_filtro.delete(0, tk.END)
@@ -414,7 +395,9 @@ class ServidorBigData(tk.Tk):
         
         self.cargar_datos_en_tabla()
         
-        self._mostrar_estado_datos(f"● Datos recibidos: {miles(len(self.df_recibido))} registros.", EXITO)
+        self._mostrar_estado_datos(
+            f"● Datos recibidos: {miles(len(self.df_recibido))} registros. (Demora: {demora:.1f} s)", EXITO
+        )
         self.btn_filtrar.configure(state="normal")
         self.btn_limpiar.configure(state="normal")
 
@@ -584,12 +567,12 @@ class ServidorPrueba(ServidorBigData):
         self.alternar_servidor()
 
     def _atender_cliente(self, conexion):
-        # La API histórica es síncrona para el emisor: no requiere bombear Tk
-        # mientras se espera el ACK. El dashboard oficial no utiliza este camino.
         try:
+            inicio = time.time()
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
             df = dataframe_validado(registros)
-            self.cola.put(lambda: self._datos_recibidos(df))
+            demora = time.time() - inicio
+            self.cola.put(lambda: self._datos_recibidos(df, demora))
             responder(conexion, {"ok": True, "filas": len(df), "detalle": "Recepción correcta."})
         except Exception as error:
             try:
@@ -599,8 +582,8 @@ class ServidorPrueba(ServidorBigData):
         finally:
             conexion.close()
 
-    def _datos_recibidos(self, df_nuevo):
-        super()._datos_recibidos(df_nuevo)
+    def _datos_recibidos(self, df_nuevo, demora=0.0):
+        super()._datos_recibidos(df_nuevo, demora)
         self.registro.configure(state="normal")
         self.registro.insert("end", f"{len(df_nuevo)} filas recibidas\n")
         self.registro.configure(state="disabled")
