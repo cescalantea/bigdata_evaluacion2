@@ -35,3 +35,13 @@ Ya fallaba antes del cambio:
 El contrato no cambia: un arreglo JSON, `<EOF>` y respuesta `{"ok", "filas"}`.
 
 Estado: nota enviada al Grupo 4 el 27-10-2026. El script modificado no se incluye en esta rama.
+
+## Remediación aplicada en `rama-envio-fusion` (28-10-2026)
+
+Tras la segunda entrega del Grupo 4 (ACK posterior a la aceptación solo en `ServidorPrueba`), se corrigió esta rama para que la suite pase completa (77 de 77):
+
+1. `ServidorBigData._atender_cliente` vuelve al ACK posterior a la aceptación (con la demora en pantalla). Las pruebas usan esta clase, no `ServidorPrueba`.
+2. `tests/test_servidor.py`: límites de `esperar`/`terminar` de 8 s a 30 s (el envío real tarda ~9 s) y el simulacro `fallar` acepta el nuevo argumento `demora`.
+3. `tests/test_cliente.py`: la prueba del servidor de prueba envía en un hilo mientras Tk gira, porque ahora el ACK espera a la ventana.
+
+Pendiente de conversar con el Grupo 4: confirmar que esta es la semántica que quieren (ACK = recibido y aceptado).

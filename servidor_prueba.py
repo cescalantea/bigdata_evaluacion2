@@ -354,26 +354,44 @@ class ServidorBigData(tk.Tk):
                 self._hilo_cliente.join()
             self.cola.put(self._al_detenerse)
 
+    # Propósito: recibir, validar y aplicar los datos en la interfaz ANTES de responder el ACK.
+    # Así "ok: true" significa "recibido y aceptado", no solo "recibido".
     def _atender_cliente(self, conexion):
         inicio = time.time()
         try:
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
             df_nuevo = dataframe_validado(registros)
             del registros
-            
-            # Enviar ACK inmediatamente para cumplir el contrato y no bloquear tests headless
-            resultado = {"ok": True, "filas": len(df_nuevo)}
+            demora = time.time() - inicio   # red + validación, se muestra en pantalla
+            aceptado = threading.Event()
+            cancelado = threading.Event()
+            decision = threading.Lock()
+            resultado = {}
+            # La decisión, su aplicación y la señal se realizan en el hilo Tk.
+            def aceptar():
+                with decision:
+                    anterior = self.df_recibido, self.df_actual, self.pagina_actual
+                    try:
+                        if cancelado.is_set() or self.detener_escucha.is_set() or self._cerrando:
+                            raise ValueError("Transferencia cancelada: servidor detenido o aceptación vencida.")
+                        self._datos_recibidos(df_nuevo, demora)
+                        self._mostrar_estado("● Recepción completada. Servidor a la escucha.", EXITO)
+                        resultado.update(ok=True, filas=len(df_nuevo))
+                    except Exception as error:
+                        self.df_recibido, self.df_actual, self.pagina_actual = anterior
+                        resultado.update(ok=False, filas=0, detalle=str(error))
+                    finally:
+                        aceptado.set()
+            self.cola.put(aceptar)
+            limite = time.monotonic() + TIEMPO_ESPERA
+            while not aceptado.wait(PASO_ESPERA):
+                if self.detener_escucha.is_set() or time.monotonic() > limite:
+                    with decision:
+                        if aceptado.is_set():
+                            break
+                        cancelado.set()
+                    raise ValueError("Transferencia cancelada o tiempo de aceptación agotado.")
             responder(conexion, resultado)
-            
-            demora = time.time() - inicio
-            
-            def actualizar_gui():
-                if not self._cerrando and not self.detener_escucha.is_set():
-                    self._datos_recibidos(df_nuevo, demora)
-                    self._mostrar_estado("● Recepción completada. Servidor a la escucha.", EXITO)
-
-            self.cola.put(actualizar_gui)
-            
         except Exception as error:
             mensaje = str(error)
             try:
@@ -567,18 +585,61 @@ class ServidorPrueba(ServidorBigData):
         self.alternar_servidor()
 
     def _atender_cliente(self, conexion):
+        inicio = time.time()  # ⏱️ 1. Iniciamos cronómetro
         try:
-            inicio = time.time()
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
-            df = dataframe_validado(registros)
-            demora = time.time() - inicio
-            self.cola.put(lambda: self._datos_recibidos(df, demora))
-            responder(conexion, {"ok": True, "filas": len(df), "detalle": "Recepción correcta."})
+            df_nuevo = dataframe_validado(registros)
+            del registros
+            
+            demora = time.time() - inicio  # ⏱️ 2. Calculamos tiempo de red y procesamiento
+            
+            aceptado = threading.Event()
+            cancelado = threading.Event()
+            decision = threading.Lock()
+            resultado = {}
+            
+            # La decisión, su aplicación y la señal se realizan en el hilo Tk.
+            def aceptar():
+                with decision:
+                    anterior = self.df_recibido, self.df_actual, self.pagina_actual
+                    try:
+                        if cancelado.is_set() or self.detener_escucha.is_set() or self._cerrando:
+                            raise ValueError("Transferencia cancelada: servidor detenido o aceptación vencida.")
+                        
+                        # 🎨 3. Pasamos los datos y el tiempo a la interfaz gráfica
+                        self._datos_recibidos(df_nuevo, demora)
+                        self._mostrar_estado("● Recepción completada. Servidor a la escucha.", EXITO)
+                        
+                        resultado.update(ok=True, filas=len(df_nuevo))
+                    except Exception as error:
+                        self.df_recibido, self.df_actual, self.pagina_actual = anterior
+                        resultado.update(ok=False, filas=0, detalle=str(error))
+                    finally:
+                        aceptado.set()
+            
+            self.cola.put(aceptar)
+            limite = time.monotonic() + TIEMPO_ESPERA
+            
+            # 🔒 4. Esperamos estrictamente a que la GUI avise que terminó antes del ACK
+            while not aceptado.wait(PASO_ESPERA):
+                if self.detener_escucha.is_set() or time.monotonic() > limite:
+                    with decision:
+                        if aceptado.is_set():
+                            break
+                        cancelado.set()
+                    raise ValueError("Transferencia cancelada o tiempo de aceptación agotado.")
+            
+            # ✅ 5. Enviamos el ACK final
+            responder(conexion, resultado)
+            
         except Exception as error:
+            mensaje = str(error)
             try:
-                responder(conexion, {"ok": False, "filas": 0, "detalle": str(error)})
+                responder(conexion, {"ok": False, "filas": 0, "detalle": mensaje})
             except OSError:
                 pass
+            self.cola.put(lambda texto=mensaje: self._mostrar_estado(
+                f"● Error en transferencia: {texto}", ERROR))
         finally:
             conexion.close()
 

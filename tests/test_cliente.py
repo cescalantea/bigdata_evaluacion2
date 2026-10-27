@@ -308,9 +308,11 @@ def test_envio_a_traves_de_la_ventana_queda_en_el_registro(csv_chico, ventana_se
     ventana_servidor.alternar()
     ds = Dataset()
     ds.cargar(csv_chico)
-    respuesta = EmisorTCP().enviar(ds.datos, "127.0.0.1", puerto, 2)
+    # El servidor responde el ACK cuando su ventana aplica los datos: hay que dejar girar Tk mientras se envía.
+    hilo, resultado = enviar_en_hilo(EmisorTCP(), ds.datos, puerto)
+    esperar(ventana_servidor, lambda: not hilo.is_alive(), 10)
     esperar(ventana_servidor, lambda: "filas recibidas" in ventana_servidor.registro.get("1.0", "end"))
-    assert respuesta["ok"] is True
+    assert resultado["respuesta"]["ok"] is True
     assert "4 filas recibidas" in ventana_servidor.registro.get("1.0", "end")
 
 
