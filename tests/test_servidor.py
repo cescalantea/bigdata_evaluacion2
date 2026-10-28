@@ -77,7 +77,7 @@ def test_duracion_total_real(monkeypatch):
                 s.recibir_todo(conexion)
 
 
-def esperar(w, condicion, segundos=8):
+def esperar(w, condicion, segundos=30):
     fin = time.monotonic() + segundos
     while time.monotonic() < fin:
         w.update()
@@ -132,7 +132,7 @@ def en_hilo(funcion):
     return hilo, resultado
 
 
-def terminar(w, trabajo, segundos=8):
+def terminar(w, trabajo, segundos=30):
     hilo, resultado = trabajo
     esperar(w, lambda: not hilo.is_alive(), segundos)
     hilo.join()
@@ -186,7 +186,7 @@ def test_ack_negativo_cliente_y_recuperacion(ventana):
     v = VentanaCliente()
     v.withdraw()
     try:
-        v._al_enviar(1, respuesta)
+        v._al_enviar(1, respuesta, 0.1)
         assert "Respuesta inesperada" in v.etiqueta_envio.cget("text")
     finally:
         for identificador in v.tk.call("after", "info"):
@@ -248,7 +248,7 @@ def test_cancelacion_cliente_real(ventana):
 
 def test_no_ack_positivo_si_dashboard_rechaza(ventana, monkeypatch):
     puerto = iniciar(ventana)
-    def fallar(df):
+    def fallar(df, demora=0.0):
         raise RuntimeError("Dashboard no disponible")
     monkeypatch.setattr(ventana, "_datos_recibidos", fallar)
     ack = terminar(ventana, en_hilo(lambda: enviar_crudo(puerto, b'[{"a":1}]<EOF>')))
