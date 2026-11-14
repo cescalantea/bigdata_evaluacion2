@@ -42,6 +42,7 @@ if load_dotenv is not None:
 
 HOST = os.environ.get("SERVIDOR_HOST", "127.0.0.1")
 PUERTO = int(os.environ.get("SERVIDOR_PUERTO", "12345"))
+PUERTO_SENSORES = int(os.environ.get("SERVIDOR_PUERTO_SENSORES", "12346"))
 MARCA_FIN = "<EOF>"
 
 # Límites por conexión; 512 MiB permite la carga sintética de ocho columnas.
@@ -114,6 +115,176 @@ def responder(conexion, respuesta):
     conexion.sendall(json.dumps(respuesta, allow_nan=False).encode("utf-8"))
 
 
+def responder_linea(conexion, respuesta):
+    """ACK para el protocolo tipado: un objeto JSON por linea."""
+    conexion.settimeout(1)
+    conexion.sendall(json.dumps(respuesta, allow_nan=False).encode("utf-8") + b"\n")
+
+
+def recibir_sensores(conexion, on_sensor, detener=None):
+    """Recibe JSON Lines de sensores en una conexion dedicada."""
+    conexion.settimeout(PASO_ESPERA)
+    buffer = bytearray()
+    inicio = avance = time.monotonic()
+    cantidad = 0
+
+    def procesar(linea):
+        nonlocal cantidad
+        try:
+            mensaje = json.loads(linea.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"Mensaje SENSOR invalido: {error}") from error
+        if not isinstance(mensaje, dict) or mensaje.get("type") != "SENSOR":
+            raise ValueError("El puerto de sensores solo acepta mensajes type=SENSOR.")
+        on_sensor(mensaje, conexion)
+        cantidad += 1
+
+    while True:
+        ahora = time.monotonic()
+        if detener is not None and detener.is_set():
+            raise ValueError("Recepcion de sensores cancelada: servidor detenido.")
+        if ahora - avance > TIEMPO_ESPERA or ahora - inicio > TIEMPO_TOTAL:
+            raise TimeoutError("Tiempo de recepcion de sensores agotado.")
+        try:
+            bloque = conexion.recv(64 * 1024)
+        except socket.timeout:
+            continue
+        if not bloque:
+            break
+        avance = time.monotonic()
+        buffer.extend(bloque)
+        if len(buffer) > MAX_BYTES:
+            raise ValueError("El canal de sensores supero el tamaño maximo permitido.")
+        while b"\n" in buffer:
+            linea, _, resto = buffer.partition(b"\n")
+            buffer = bytearray(resto)
+            if linea.strip():
+                procesar(linea.strip())
+
+    if buffer.strip():
+        procesar(buffer.strip())
+    return cantidad
+
+
+def recibir_contrato(conexion, detener=None, on_sensor=None):
+    """Recibe el contrato antiguo o el nuevo contrato tipado.
+
+    Compatibilidad historica:
+        ``[{...},{...}]<EOF>`` se interpreta como un CSV completo.
+
+    Contrato nuevo:
+        Cada linea es un JSON con ``type``. Se aceptan ``SENSOR``,
+        ``CSV_START``, ``CSV_DATA`` y ``CSV_END``. Como TCP es un flujo,
+        las lineas se reconstruyen aunque lleguen fragmentadas.
+    """
+    conexion.settimeout(PASO_ESPERA)
+    inicio = avance = time.monotonic()
+    buffer = bytearray()
+    legado = bytearray()
+    modo = None
+    registros = []
+    csv_iniciado = False
+    csv_finalizado = False
+    sensores = 0
+
+    def procesar_linea(linea):
+        nonlocal csv_iniciado, csv_finalizado, sensores
+        try:
+            mensaje = json.loads(linea.decode("utf-8"), parse_constant=lambda valor: (_ for _ in ()).throw(
+                ValueError(f"Constante JSON no valida: {valor}")))
+        except (UnicodeError, json.JSONDecodeError, ValueError) as error:
+            raise ValueError(f"Mensaje tipado invalido: {error}") from error
+        if not isinstance(mensaje, dict):
+            raise ValueError("Cada mensaje tipado debe ser un objeto JSON.")
+        tipo = mensaje.get("type")
+        if tipo == "SENSOR":
+            if not {"temp", "hum", "gas"}.issubset(mensaje):
+                raise ValueError("El mensaje SENSOR requiere temp, hum y gas.")
+            if on_sensor is not None:
+                on_sensor(mensaje, conexion)
+            sensores += 1
+            return
+        if tipo == "CSV_START":
+            if csv_iniciado:
+                raise ValueError("El CSV ya fue iniciado en esta conexion.")
+            csv_iniciado = True
+            return
+        if tipo == "CSV_DATA":
+            if not csv_iniciado or csv_finalizado:
+                raise ValueError("CSV_DATA debe estar entre CSV_START y CSV_END.")
+            filas = mensaje.get("rows")
+            if not isinstance(filas, list) or not all(isinstance(fila, dict) for fila in filas):
+                raise ValueError("CSV_DATA.rows debe ser una lista de objetos.")
+            registros.extend(filas)
+            return
+        if tipo == "CSV_END":
+            if not csv_iniciado:
+                raise ValueError("CSV_END recibido sin CSV_START.")
+            if mensaje.get("status", "OK") != "OK":
+                raise ValueError("El cliente marco la transferencia CSV como fallida.")
+            csv_finalizado = True
+            return
+        raise ValueError(f"Tipo de mensaje no reconocido: {tipo!r}.")
+
+    while True:
+        ahora = time.monotonic()
+        if detener is not None and detener.is_set():
+            raise ValueError("Transferencia cancelada: servidor detenido.")
+        if ahora - avance > TIEMPO_ESPERA or ahora - inicio > TIEMPO_TOTAL:
+            raise TimeoutError("Tiempo de recepcion agotado.")
+        try:
+            bloque = conexion.recv(1024 * 1024)
+        except socket.timeout:
+            continue
+        if not bloque:
+            break
+        avance = time.monotonic()
+        if modo is None:
+            buffer.extend(bloque)
+            prefijo = bytes(buffer).lstrip()
+            if not prefijo:
+                continue
+            if prefijo.startswith(b"["):
+                modo = "LEGACY"
+                legado.extend(buffer)
+                buffer.clear()
+            elif prefijo.startswith(b"{"):
+                modo = "TIPADO"
+            else:
+                raise ValueError("El mensaje debe comenzar con JSON de lista u objeto.")
+        elif modo == "LEGACY":
+            legado.extend(bloque)
+        else:
+            buffer.extend(bloque)
+
+        if modo == "LEGACY":
+            if len(legado) > MAX_BYTES:
+                raise ValueError("El cliente supero el tamaño maximo permitido.")
+            continue
+
+        while b"\n" in buffer:
+            linea, _, resto = buffer.partition(b"\n")
+            buffer = bytearray(resto)
+            if linea.strip():
+                if len(linea) > MAX_BYTES:
+                    raise ValueError("El mensaje tipado supero el tamaño maximo permitido.")
+                procesar_linea(linea.strip())
+        if len(buffer) > MAX_BYTES:
+            raise ValueError("El mensaje tipado supero el tamaño maximo permitido.")
+        if csv_finalizado:
+            break
+
+    if modo == "LEGACY":
+        return {"modo": modo, "registros": decodificar(legado), "sensores": 0, "es_csv": True}
+    if modo != "TIPADO":
+        raise ValueError("No se recibio ningun mensaje.")
+    if buffer.strip():
+        procesar_linea(buffer.strip())
+    if csv_iniciado and not csv_finalizado:
+        raise ValueError("Falta CSV_END: el envio tipado quedo incompleto.")
+    return {"modo": modo, "registros": registros, "sensores": sensores, "es_csv": csv_iniciado}
+
+
 def atender(conexion, registrar=print):
     """Adaptador histórico sin GUI, con el mismo receptor y validaciones oficiales.
 
@@ -157,6 +328,7 @@ class MongoRepositorio:
             raise ValueError("MONGODB_BATCH_SIZE y MONGODB_TIMEOUT_MS deben ser positivos.")
         self._cliente = None
         self._db = None
+        self._conexion_lock = threading.Lock()
 
     @property
     def habilitado(self):
@@ -167,24 +339,25 @@ class MongoRepositorio:
         """Abre la conexion y comprueba que Atlas responda."""
         if not self.habilitado:
             return False
-        if self._cliente is not None:
-            return True
-        try:
-            from pymongo import MongoClient
-            self._cliente = MongoClient(self.uri, serverSelectionTimeoutMS=self.timeout_ms)
-            self._cliente.admin.command("ping")
-            self._db = self._cliente[self.nombre_bd]
-            return True
-        except ImportError as error:
-            raise RuntimeError(
-                "Falta pymongo. Ejecute: python -m pip install -r requirements.txt"
-            ) from error
-        except Exception:
+        with self._conexion_lock:
             if self._cliente is not None:
-                self._cliente.close()
-            self._cliente = None
-            self._db = None
-            raise
+                return True
+            try:
+                from pymongo import MongoClient
+                self._cliente = MongoClient(self.uri, serverSelectionTimeoutMS=self.timeout_ms)
+                self._cliente.admin.command("ping")
+                self._db = self._cliente[self.nombre_bd]
+                return True
+            except ImportError as error:
+                raise RuntimeError(
+                    "Falta pymongo. Ejecute: python -m pip install -r requirements.txt"
+                ) from error
+            except Exception:
+                if self._cliente is not None:
+                    self._cliente.close()
+                self._cliente = None
+                self._db = None
+                raise
 
     @staticmethod
     def _valor_mongo(valor):
@@ -217,12 +390,13 @@ class MongoRepositorio:
         coleccion = self._db[self.coleccion_csv]
         insertados = 0
         documentos = []
+        recibido_en = datetime.now(timezone.utc)
         for numero_fila, fila in enumerate(dataframe.to_dict("records"), start=1):
             documentos.append({
                 "transfer_id": transferencia_id,
                 "row_number": numero_fila,
                 "data": {str(clave): self._valor_mongo(valor) for clave, valor in fila.items()},
-                "received_at": datetime.now(timezone.utc),
+                "received_at": recibido_en,
             })
             if len(documentos) >= self.tamano_lote:
                 coleccion.insert_many(documentos, ordered=False)
@@ -291,16 +465,24 @@ class ServidorBigData(tk.Tk):
 
         # Variables de Red y Concurrencia
         self.servidor = None
+        self.servidor_sensores = None
         self.detener_escucha = threading.Event()
         self.cola = queue.Queue()
         self._cerrando = False
         self._after_cola = None
         self._hilo_escucha = None
+        self._hilo_escucha_sensores = None
         self._hilo_cliente = None
+        self._hilos_clientes = set()
+        self._hilos_clientes_lock = threading.Lock()
         self._hilo_filtro = None
         self._version_filtro = 0
         self.mongo = MongoRepositorio()
         self._ultima_persistencia = None
+        self._sensores_recibidos = 0
+        self._sensores_lock = threading.Lock()
+        self._escuchas_finalizadas = 0
+        self._escuchas_lock = threading.Lock()
 
         self._crear_estilos()
         self._crear_widgets()
@@ -343,11 +525,16 @@ class ServidorBigData(tk.Tk):
         cont_red.pack(fill="x")
         
         self.var_ip, self.var_puerto = tk.StringVar(value=HOST), tk.StringVar(value=str(PUERTO))
+        self.var_puerto_sensores = tk.StringVar(value=str(PUERTO_SENSORES))
         ttk.Label(cont_red, text="IP", style="Suave.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Entry(cont_red, textvariable=self.var_ip, width=16).grid(row=0, column=1, padx=(6, 14))
         ttk.Label(cont_red, text="Puerto", style="Suave.TLabel").grid(row=0, column=2, sticky="w")
         ttk.Entry(cont_red, textvariable=self.var_puerto, width=7).grid(row=0, column=3, padx=(6, 14))
-        
+        ttk.Label(cont_red, text="Sensores", style="Suave.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(cont_red, textvariable=self.var_puerto_sensores, width=7).grid(row=1, column=1, padx=(6, 14), pady=(8, 0))
+        ttk.Label(cont_red, text="CSV: 12345 · Sensores: 12346", style="Suave.TLabel").grid(
+            row=1, column=2, columnspan=2, sticky="w", pady=(8, 0))
+
         self.boton_red = ttk.Button(cont_red, text="Iniciar escucha", style="Acento.TButton", command=self.alternar_servidor)
         self.boton_red.grid(row=0, column=4, sticky="e")
         cont_red.columnconfigure(4, weight=1)
@@ -420,27 +607,49 @@ class ServidorBigData(tk.Tk):
     def iniciar(self):
         if self.servidor is not None or self._cerrando:
             return
-        host, texto_puerto = self.var_ip.get().strip(), self.var_puerto.get().strip()
-        if not host or not texto_puerto.isdigit() or not 0 < int(texto_puerto) < 65536:
-            self._mostrar_estado("● Revise la IP y el puerto (1-65535)", ERROR)
+        host = self.var_ip.get().strip()
+        texto_puerto = self.var_puerto.get().strip()
+        texto_puerto_sensores = self.var_puerto_sensores.get().strip()
+        puertos_validos = all(
+            texto.isdigit() and 0 < int(texto) < 65536
+            for texto in (texto_puerto, texto_puerto_sensores)
+        )
+        if not host or not puertos_validos or int(texto_puerto) == int(texto_puerto_sensores):
+            self._mostrar_estado("● Revise IP y puertos distintos (1-65535)", ERROR)
             return
-            
+
+        serv_socket = None
+        sensores_socket = None
         try:
             serv_socket = socket.create_server((host, int(texto_puerto)))
+            sensores_socket = socket.create_server((host, int(texto_puerto_sensores)))
         except OSError as error:
+            if serv_socket is not None:
+                serv_socket.close()
+            if sensores_socket is not None:
+                sensores_socket.close()
             motivo = "el puerto ya está en uso" if error.errno in (10048, 98) else str(error)
-            self._mostrar_estado(f"● Error al abrir puerto {texto_puerto}: {motivo}", ERROR)
+            self._mostrar_estado(f"● Error al abrir puertos: {motivo}", ERROR)
             return
-            
+
         serv_socket.settimeout(0.5)
+        sensores_socket.settimeout(0.5)
         self.servidor = serv_socket
+        self.servidor_sensores = sensores_socket
         self.detener_escucha.clear()
-        
-        self._hilo_escucha = threading.Thread(target=self._bucle_escucha, args=(serv_socket,), daemon=True)
+
+        with self._escuchas_lock:
+            self._escuchas_finalizadas = 0
+        self._hilo_escucha = threading.Thread(
+            target=self._bucle_escucha, args=(serv_socket, "CSV"), daemon=True)
+        self._hilo_escucha_sensores = threading.Thread(
+            target=self._bucle_escucha, args=(sensores_socket, "SENSORES"), daemon=True)
         self._hilo_escucha.start()
-        
+        self._hilo_escucha_sensores.start()
+
         self.boton_red.configure(text="Detener escucha", style="Alto.TButton")
-        self._mostrar_estado(f"● Escuchando en {host}:{texto_puerto}", EXITO)
+        self._mostrar_estado(
+            f"● CSV en {host}:{texto_puerto} · sensores en {host}:{texto_puerto_sensores}", EXITO)
 
     def detener(self):
         if self.servidor is not None:
@@ -450,10 +659,11 @@ class ServidorBigData(tk.Tk):
 
     def _al_detenerse(self):
         self.servidor = None
+        self.servidor_sensores = None
         self.boton_red.configure(text="Iniciar escucha", style="Acento.TButton", state="normal")
         self._mostrar_estado("● Servidor detenido", SUAVE)
 
-    def _bucle_escucha(self, servidor):
+    def _bucle_escucha(self, servidor, tipo):
         try:
             while not self.detener_escucha.is_set():
                 try:
@@ -462,30 +672,44 @@ class ServidorBigData(tk.Tk):
                     continue
                 except OSError:
                     break
-                if self.detener_escucha.is_set() or (
-                    self._hilo_cliente is not None and self._hilo_cliente.is_alive()
-                ):
+                if self.detener_escucha.is_set():
                     try:
-                        responder(conexion, {"ok": False, "filas": 0,
-                                            "detalle": "Servidor ocupado o deteniéndose; reintente."})
+                        respuesta = {"ok": False, "filas": 0,
+                                     "detalle": "Servidor deteniendose; reintente."}
+                        if tipo == "SENSORES":
+                            responder_linea(conexion, {**respuesta, "type": "ERROR"})
+                        else:
+                            responder(conexion, respuesta)
                     except OSError:
                         pass
                     finally:
                         conexion.close()
                     continue
                 self.cola.put(lambda ip=direccion[0]: self._mostrar_estado(
-                    f"● Recibiendo paquete de {ip}...", AVISO))
-                self._hilo_cliente = threading.Thread(
-                    target=self._atender_cliente, args=(conexion,), daemon=True)
-                self._hilo_cliente.start()
+                    f"● Recibiendo {tipo.lower()} de {ip}...", AVISO))
+                trabajador = self._atender_cliente if tipo == "CSV" else self._atender_sensores
+                hilo = threading.Thread(
+                    target=trabajador, args=(conexion,), daemon=True,
+                    name=f"{tipo.lower()}-{direccion[0]}-{direccion[1]}")
+                with self._hilos_clientes_lock:
+                    self._hilos_clientes.add(hilo)
+                    self._hilo_cliente = hilo  # Compatibilidad con la API historica.
+                hilo.start()
         finally:
             servidor.close()
-            if self._hilo_cliente is not None:
-                self._hilo_cliente.join()
-            self.cola.put(self._al_detenerse)
+            with self._hilos_clientes_lock:
+                hilos = list(self._hilos_clientes)
+            for hilo in hilos:
+                hilo.join()
+            with self._escuchas_lock:
+                self._escuchas_finalizadas += 1
+                todas_finalizadas = self._escuchas_finalizadas >= 2
+            if todas_finalizadas:
+                self.cola.put(self._al_detenerse)
 
     def _atender_cliente(self, conexion):
         try:
+            # El puerto CSV conserva el contrato de Evaluacion 2.
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
             df_nuevo = dataframe_validado(registros)
             del registros
@@ -536,6 +760,69 @@ class ServidorBigData(tk.Tk):
                 f"● Error en transferencia: {texto}", ERROR))
         finally:
             conexion.close()
+            hilo_actual = threading.current_thread()
+            with self._hilos_clientes_lock:
+                self._hilos_clientes.discard(hilo_actual)
+
+    def _atender_sensores(self, conexion):
+        """Atiende el puerto dedicado de sensores sin tocar el dashboard CSV."""
+        try:
+            cantidad = recibir_sensores(conexion, self._atender_sensor, self.detener_escucha)
+            responder_linea(conexion, {
+                "ok": True,
+                "type": "SENSOR_STREAM_ACK",
+                "sensores": cantidad,
+            })
+        except Exception as error:
+            try:
+                responder_linea(conexion, {
+                    "ok": False,
+                    "type": "ERROR",
+                    "detalle": str(error),
+                })
+            except OSError:
+                pass
+            self.cola.put(lambda texto=str(error): self._mostrar_estado(
+                f"● Error en sensores: {texto}", ERROR))
+        finally:
+            conexion.close()
+            hilo_actual = threading.current_thread()
+            with self._hilos_clientes_lock:
+                self._hilos_clientes.discard(hilo_actual)
+
+    def _atender_sensor(self, mensaje, conexion):
+        """Valida, persiste y confirma una lectura sin bloquear el CSV."""
+        try:
+            temperatura = mensaje.get("temperature", mensaje.get("temp"))
+            humedad = mensaje.get("humidity", mensaje.get("hum"))
+            gas = mensaje.get("gas")
+            valores = {
+                "temperatura": float(temperatura),
+                "humedad": float(humedad),
+                "gas": float(gas),
+            }
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(f"Lectura SENSOR invalida: {error}") from error
+        if not all(math.isfinite(valor) for valor in valores.values()):
+            raise ValueError("La lectura SENSOR contiene un numero no finito.")
+        persistencia = self.mongo.guardar_sensor(
+            valores["temperatura"], valores["humedad"], valores["gas"],
+            mensaje.get("timestamp", mensaje.get("fecha_hora"))
+        )
+        with self._sensores_lock:
+            self._sensores_recibidos += 1
+            total = self._sensores_recibidos
+        try:
+            responder_linea(conexion, {
+                "ok": True,
+                "type": "SENSOR_ACK",
+                "persisted": persistencia["habilitado"],
+                "sensores": total,
+            })
+        except OSError:
+            pass
+        self.cola.put(lambda total=total: self._mostrar_estado(
+            f"● Sensor recibido: {total} lectura(s).", EXITO))
 
     def _datos_recibidos(self, df_nuevo):
         self._version_filtro += 1
@@ -696,8 +983,17 @@ class ServidorBigData(tk.Tk):
 
     def _esperar_cierre(self):
         # No bloquear Tk mientras los trabajadores observan la cancelación.
-        hilos = (self._hilo_escucha, self._hilo_cliente, self._hilo_filtro)
-        if any(h is not None and h.is_alive() for h in hilos):
+        hilos = (
+            self._hilo_escucha,
+            self._hilo_escucha_sensores,
+            self._hilo_cliente,
+            self._hilo_filtro,
+        )
+        with self._hilos_clientes_lock:
+            hilos_clientes = tuple(self._hilos_clientes)
+        if any(h is not None and h.is_alive() for h in hilos) or any(
+            hilo.is_alive() for hilo in hilos_clientes
+        ):
             self.after(50, self._esperar_cierre)
         else:
             while not self.cola.empty():
@@ -732,6 +1028,9 @@ class ServidorPrueba(ServidorBigData):
                 pass
         finally:
             conexion.close()
+            hilo_actual = threading.current_thread()
+            with self._hilos_clientes_lock:
+                self._hilos_clientes.discard(hilo_actual)
 
     def _datos_recibidos(self, df_nuevo):
         super()._datos_recibidos(df_nuevo)

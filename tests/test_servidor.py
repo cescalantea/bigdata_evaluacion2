@@ -47,6 +47,21 @@ def test_rechazos(datos):
         recibir([datos])
 
 
+def test_puerto_sensores_reconstruye_json_lines_fragmentados():
+    mensajes = (
+        b'{"type":"SENSOR","timestamp":"2026-11-14T14:32:10",'
+        b'"temperature":23.8,"humidity":56.4,"gas":412}\n'
+        b'{"type":"SENSOR","temp":24.1,"hum":55.9,"gas":418}\n'
+    )
+    sensores = []
+    cantidad = s.recibir_sensores(
+        Fragmentos([bytes([byte]) for byte in mensajes]),
+        lambda mensaje, conexion: sensores.append(mensaje),
+    )
+    assert cantidad == 2
+    assert [m["gas"] for m in sensores] == [412, 418]
+
+
 def test_limite_y_cancelacion(monkeypatch):
     monkeypatch.setattr(s, "MAX_BYTES", 4)
     with pytest.raises(ValueError, match="máximo"):
@@ -114,7 +129,10 @@ def ventana():
 def iniciar(w):
     with socket.create_server(("127.0.0.1", 0)) as libre:
         puerto = libre.getsockname()[1]
+    with socket.create_server(("127.0.0.1", 0)) as libre:
+        puerto_sensores = libre.getsockname()[1]
     w.var_puerto.set(str(puerto))
+    w.var_puerto_sensores.set(str(puerto_sensores))
     w.iniciar()
     assert w.servidor is not None
     return puerto
@@ -200,17 +218,21 @@ def test_ack_negativo_cliente_y_recuperacion(ventana):
 
 def test_simultaneas_detencion_reinicio(ventana):
     puerto = iniciar(ventana)
+    puerto_sensores = int(ventana.var_puerto_sensores.get())
     c = socket.create_connection(("127.0.0.1", puerto), timeout=5)
     try:
         c.sendall(b'[{"a":')
         esperar(ventana, lambda: ventana._hilo_cliente is not None)
-        with socket.create_connection(("127.0.0.1", puerto), timeout=5) as segundo:
-            respuesta = json.loads(segundo.recv(4096))
-        assert not respuesta["ok"] and "ocupado" in respuesta["detalle"]
+        with socket.create_connection(("127.0.0.1", puerto_sensores), timeout=5) as sensor:
+            sensor.sendall(b'{"type":"SENSOR","temperature":23.8,"humidity":56.4,"gas":412}\n')
+            sensor.shutdown(socket.SHUT_WR)
+            respuesta = json.loads(sensor.recv(4096))
+        assert respuesta["ok"] and respuesta["type"] == "SENSOR_ACK"
         ventana.detener()
         esperar(ventana, lambda: ventana.servidor is None)
-        assert not ventana._hilo_cliente.is_alive()
+        assert not ventana._hilos_clientes
         assert not ventana._hilo_escucha.is_alive()
+        assert not ventana._hilo_escucha_sensores.is_alive()
         assert not json.loads(c.recv(4096))["ok"]
     finally:
         c.close()
