@@ -22,9 +22,19 @@ import threading
 import time
 import logging
 import math
+import uuid
+from datetime import datetime, timezone
 import tkinter as tk
 from tkinter import ttk
 import pandas as pd
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # Permite ejecutar la demo sin configurar Atlas.
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuración y Estilos Visuales (Homologados con el Cliente)
@@ -132,6 +142,119 @@ def filtrar_dataframe(df, texto):
         mascara |= df[columna].astype("string").str.contains(texto, case=False, regex=False, na=False)
     return df.loc[mascara]
 
+
+class MongoRepositorio:
+    """Persistencia MongoDB Atlas por lotes, sin credenciales en el codigo."""
+
+    def __init__(self):
+        self.uri = os.environ.get("MONGODB_URI", "").strip()
+        self.nombre_bd = os.environ.get("MONGODB_DB", "bigdata_eval3").strip()
+        self.coleccion_csv = os.environ.get("MONGODB_COLLECTION_CSV", "datos_csv").strip()
+        self.coleccion_sensores = os.environ.get("MONGODB_COLLECTION_SENSORES", "sensores").strip()
+        self.tamano_lote = int(os.environ.get("MONGODB_BATCH_SIZE", "1000"))
+        self.timeout_ms = int(os.environ.get("MONGODB_TIMEOUT_MS", "5000"))
+        if self.tamano_lote <= 0 or self.timeout_ms <= 0:
+            raise ValueError("MONGODB_BATCH_SIZE y MONGODB_TIMEOUT_MS deben ser positivos.")
+        self._cliente = None
+        self._db = None
+
+    @property
+    def habilitado(self):
+        """Indica si se configuro una URI de MongoDB."""
+        return bool(self.uri)
+
+    def conectar(self):
+        """Abre la conexion y comprueba que Atlas responda."""
+        if not self.habilitado:
+            return False
+        if self._cliente is not None:
+            return True
+        try:
+            from pymongo import MongoClient
+            self._cliente = MongoClient(self.uri, serverSelectionTimeoutMS=self.timeout_ms)
+            self._cliente.admin.command("ping")
+            self._db = self._cliente[self.nombre_bd]
+            return True
+        except ImportError as error:
+            raise RuntimeError(
+                "Falta pymongo. Ejecute: python -m pip install -r requirements.txt"
+            ) from error
+        except Exception:
+            if self._cliente is not None:
+                self._cliente.close()
+            self._cliente = None
+            self._db = None
+            raise
+
+    @staticmethod
+    def _valor_mongo(valor):
+        """Convierte valores de Pandas/Numpy a tipos aceptados por MongoDB."""
+        if valor is None:
+            return None
+        if hasattr(valor, "item"):
+            try:
+                valor = valor.item()
+            except (ValueError, TypeError):
+                pass
+        if isinstance(valor, pd.Timestamp):
+            return valor.to_pydatetime()
+        try:
+            faltante = pd.isna(valor)
+            if isinstance(faltante, bool) and faltante:
+                return None
+        except (TypeError, ValueError):
+            pass
+        return valor
+
+    def guardar_dataframe(self, dataframe, transferencia_id=None):
+        """Guarda filas del CSV con insert_many, sin un insert por fila."""
+        if not self.habilitado:
+            return {"habilitado": False, "insertados": 0, "transferencia_id": None}
+        if dataframe is None:
+            raise ValueError("No se puede guardar un DataFrame inexistente en MongoDB.")
+        self.conectar()
+        transferencia_id = transferencia_id or uuid.uuid4().hex
+        coleccion = self._db[self.coleccion_csv]
+        insertados = 0
+        documentos = []
+        for numero_fila, fila in enumerate(dataframe.to_dict("records"), start=1):
+            documentos.append({
+                "transfer_id": transferencia_id,
+                "row_number": numero_fila,
+                "data": {str(clave): self._valor_mongo(valor) for clave, valor in fila.items()},
+                "received_at": datetime.now(timezone.utc),
+            })
+            if len(documentos) >= self.tamano_lote:
+                coleccion.insert_many(documentos, ordered=False)
+                insertados += len(documentos)
+                documentos.clear()
+        if documentos:
+            coleccion.insert_many(documentos, ordered=False)
+            insertados += len(documentos)
+        return {"habilitado": True, "insertados": insertados, "transferencia_id": transferencia_id}
+
+    def guardar_sensor(self, temperatura, humedad=None, gas=None, fecha_hora=None):
+        """Guarda una lectura IoT; queda listo para el protocolo SENSOR."""
+        if not self.habilitado:
+            return {"habilitado": False, "insertados": 0}
+        self.conectar()
+        documento = {
+            "type": "SENSOR",
+            "fecha_hora": fecha_hora or datetime.now(timezone.utc),
+            "temperatura": self._valor_mongo(temperatura),
+            "humedad": self._valor_mongo(humedad),
+            "gas": self._valor_mongo(gas),
+        }
+        self._db[self.coleccion_sensores].insert_one(documento)
+        return {"habilitado": True, "insertados": 1}
+
+    def cerrar(self):
+        """Cierra el cliente MongoDB al salir de la aplicacion."""
+        if self._cliente is not None:
+            self._cliente.close()
+            self._cliente = None
+            self._db = None
+
 FONDO, TARJETA, TEXTO, SUAVE = "#EEF2F5", "#FFFFFF", "#1F2A37", "#6B7785"
 ACENTO, ACENTO_OSCURO, EXITO, ERROR, AVISO = "#0E7490", "#155E75", "#15803D", "#B91C1C", "#B45309"
 FUENTE = "Segoe UI"
@@ -176,6 +299,8 @@ class ServidorBigData(tk.Tk):
         self._hilo_cliente = None
         self._hilo_filtro = None
         self._version_filtro = 0
+        self.mongo = MongoRepositorio()
+        self._ultima_persistencia = None
 
         self._crear_estilos()
         self._crear_widgets()
@@ -364,6 +489,10 @@ class ServidorBigData(tk.Tk):
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
             df_nuevo = dataframe_validado(registros)
             del registros
+            # La insercion ocurre fuera del hilo de Tkinter para no congelar la GUI.
+            # Sin MONGODB_URI configurada, este paso no modifica la demo local.
+            persistencia = self.mongo.guardar_dataframe(df_nuevo)
+            self._ultima_persistencia = persistencia
             aceptado = threading.Event()
             cancelado = threading.Event()
             decision = threading.Lock()
@@ -376,6 +505,10 @@ class ServidorBigData(tk.Tk):
                         if cancelado.is_set() or self.detener_escucha.is_set() or self._cerrando:
                             raise ValueError("Transferencia cancelada: servidor detenido o aceptación vencida.")
                         self._datos_recibidos(df_nuevo)
+                        if persistencia["habilitado"]:
+                            self._mostrar_estado_datos(
+                                f"● Datos recibidos: {miles(len(self.df_recibido))} registros. "
+                                f"MongoDB: {miles(persistencia['insertados'])} guardados.", EXITO)
                         self._mostrar_estado("● Recepción completada. Servidor a la escucha.", EXITO)
                         resultado.update(ok=True, filas=len(df_nuevo))
                     except Exception as error:
@@ -569,6 +702,7 @@ class ServidorBigData(tk.Tk):
         else:
             while not self.cola.empty():
                 self.cola.get_nowait()
+            self.mongo.cerrar()
             self.destroy()
 
 
