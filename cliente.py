@@ -16,14 +16,13 @@ Flujo:
 3. Elegir columnas a enviar. 
 4. Enviar al servidor.
 
-Apoyado con IA (Claude Opus 5.5)
-Propósito: Optimizar funciones de envío y mejorar la interfaz gráfica para una mejor experiencia de usuario.
-
 Requisitos: Python 3.10+ con pandas instalado (pip install pandas).
+Sensor Arduino (opcional, paso 5): pip install pyserial  (ver sensor_arduino.py).
 
 Ejecutar:  python cliente.py
 """
 
+import collections
 import csv
 import json
 import math
@@ -37,6 +36,8 @@ import warnings
 from tkinter import filedialog, ttk
 
 import pandas as pd
+
+import sensor_arduino
 
 # ---------------------------------------------------------------------------
 # Configuración
@@ -281,6 +282,75 @@ class Tarjeta(ttk.Frame):
         ttk.Label(self, text=titulo, style="Titulo.TLabel").pack(anchor="w", pady=(0, 8))
 
 
+class Espejo:
+    """
+    Reenvía configure() a varios widgets a la vez. Así el progreso del envío se ve igual
+    en las dos pestañas (CSV y Arduino) sin repetir código en cada lugar que lo actualiza.
+    """
+
+    def __init__(self, *widgets):
+        self._widgets = widgets
+
+    def configure(self, **opciones):
+        for widget in self._widgets:
+            widget.configure(**opciones)
+
+    def cget(self, opcion):
+        return self._widgets[0].cget(opcion)
+
+
+class GraficoLinea(tk.Canvas):
+    """
+    Minigráfico de líneas de UNA magnitud (cada sensor con su propia escala: nunca doble eje).
+    Guarda los últimos 'maximo' puntos y se redibuja al recibir uno o al cambiar de tamaño.
+    """
+
+    def __init__(self, padre, titulo, unidad, color, span_minimo, decimales=1, maximo=90, alto=108):
+        super().__init__(padre, bg=TARJETA, height=alto, highlightthickness=1,
+                         highlightbackground="#E3E8ED")
+        self.titulo, self.unidad, self.color = titulo, unidad, color
+        self.span_minimo, self.decimales = span_minimo, decimales
+        self.puntos = collections.deque(maxlen=maximo)
+        self.bind("<Configure>", lambda e: self._dibujar())
+
+    # Propósito: añadir un valor y redibujar.
+    def agregar(self, valor):
+        self.puntos.append(valor)
+        self._dibujar()
+
+    # Propósito: borrar la serie (al desconectar).
+    def limpiar(self):
+        self.puntos.clear()
+        self._dibujar()
+
+    # Propósito: título + valor actual arriba, y debajo la línea con escala automática.
+    def _dibujar(self):
+        self.delete("all")
+        ancho, alto = self.winfo_width(), self.winfo_height()
+        self.create_text(10, 10, anchor="w", text=self.titulo, fill=SUAVE, font=(FUENTE, 9))
+        if not self.puntos or ancho < 80:
+            return
+        actual = self.puntos[-1]
+        self.create_text(ancho - 10, 10, anchor="e", fill=TEXTO, font=(FUENTE, 11, "bold"),
+                         text=f"{actual:.{self.decimales}f} {self.unidad}".replace(".", ","))
+        izq, der, arriba, abajo = 10, ancho - 12, 26, alto - 10
+        bajo, alto_val = min(self.puntos), max(self.puntos)
+        centro = (bajo + alto_val) / 2
+        mitad = max(alto_val - bajo, self.span_minimo) / 2
+        bajo, alto_val = centro - mitad, centro + mitad
+        self.create_line(izq, abajo, der, abajo, fill="#E3E8ED")      # base, muy discreta
+        n = len(self.puntos)
+        paso = (der - izq) / max(self.puntos.maxlen - 1, 1)
+        x0 = der - (n - 1) * paso                                      # el último punto queda a la derecha
+        coords = []
+        for i, valor in enumerate(self.puntos):
+            coords += [x0 + i * paso, abajo - (valor - bajo) / (alto_val - bajo) * (abajo - arriba)]
+        if n > 1:
+            self.create_line(*coords, fill=self.color, width=2, joinstyle="round")
+        x, y = coords[-2], coords[-1]
+        self.create_oval(x - 4, y - 4, x + 4, y + 4, fill=self.color, outline=TARJETA, width=2)
+
+
 class VentanaCliente(tk.Tk):
     """
     La ventana. No sabe leer CSV ni usar sockets: delega en Dataset y EmisorTCP.
@@ -299,10 +369,15 @@ class VentanaCliente(tk.Tk):
         self.emisor = None                # el EmisorTCP del envío en curso (None = no hay envío)
         self.cola = queue.Queue()         # los hilos dejan aquí tareas para la GUI
         self.cargado = False
+        self.lector = None                # LectorSerial mientras el Arduino está conectado
+        self.grabadora = None             # Grabadora mientras se graba (REC)
+        self.grabando = False
+        self._id_muestreo = None          # id del after() que toma las muestras
 
         self._crear_estilos()
         self._crear_widgets()
         self.after(100, self._revisar_cola)
+        self.protocol("WM_DELETE_WINDOW", self._cerrar)
 
     # Propósito: definir colores y tipografía de los widgets ttk.
     def _crear_estilos(self):
@@ -328,8 +403,14 @@ class VentanaCliente(tk.Tk):
                          borderwidth=0, thickness=8)
         estilo.configure("Treeview", rowheight=22, fieldbackground=TARJETA, borderwidth=0)
         estilo.configure("Treeview.Heading", font=(FUENTE, 9, "bold"), background="#E3E8ED")
+        estilo.configure("TNotebook", background=FONDO, borderwidth=0, tabmargins=(0, 0, 0, 0))
+        estilo.configure("TNotebook.Tab", font=(FUENTE, 10, "bold"), padding=(22, 8),
+                         background="#DDE3E9", foreground=SUAVE, borderwidth=0)
+        estilo.map("TNotebook.Tab", background=[("selected", TARJETA)],
+                   foreground=[("selected", ACENTO_OSCURO)])
 
-    # Propósito: construir la pantalla. Izquierda: pasos 1, 2 y 4. Derecha: paso 3 y vista previa.
+    # Propósito: construir la pantalla con dos pestañas.
+    # CSV -> izquierda: pasos 1, 2 y 4; derecha: paso 3 y vista previa. Arduino -> sensor y servidor.
     def _crear_widgets(self):
         encabezado = ttk.Frame(self, style="Fondo.TFrame", padding=(20, 16, 20, 4))
         encabezado.pack(fill="x")
@@ -338,8 +419,14 @@ class VentanaCliente(tk.Tk):
         tk.Label(encabezado, text="Cargue un CSV, elija las columnas y transmítalo por sockets TCP",
                  bg=FONDO, fg=SUAVE, font=(FUENTE, 10)).pack(anchor="w")
 
-        cuerpo = ttk.Frame(self, style="Fondo.TFrame", padding=(20, 8, 20, 16))
-        cuerpo.pack(fill="both", expand=True)
+        marco = ttk.Frame(self, style="Fondo.TFrame", padding=(20, 8, 20, 16))
+        marco.pack(fill="both", expand=True)
+        pestanas = ttk.Notebook(marco)
+        pestanas.pack(fill="both", expand=True)
+        cuerpo = ttk.Frame(pestanas, style="Fondo.TFrame", padding=(0, 12, 0, 0))   # pestaña CSV
+        pestana_arduino = ttk.Frame(pestanas, style="Fondo.TFrame", padding=(0, 12, 0, 0))
+        pestanas.add(cuerpo, text="Archivo CSV")
+        pestanas.add(pestana_arduino, text="Sensor Arduino")
         cuerpo.columnconfigure(0, weight=2, uniform="col")
         cuerpo.columnconfigure(1, weight=3, uniform="col")
         cuerpo.rowconfigure(0, weight=1)
@@ -353,6 +440,8 @@ class VentanaCliente(tk.Tk):
         self._crear_paso_enviar(izquierda)
         self._crear_paso_columnas(derecha)
         self._crear_vista_previa(derecha)
+        self._crear_paso_arduino(pestana_arduino)
+        self._crear_servidor_arduino(pestana_arduino)
 
     # Propósito: paso 1, botón para elegir el CSV.
     def _crear_paso_cargar(self, padre):
@@ -466,7 +555,7 @@ class VentanaCliente(tk.Tk):
     # Propósito: bloquear los botones mientras un hilo trabaja y habilitarlos después.
     def _bloquear(self, bloqueado):
         self.boton_cargar.configure(state="disabled" if bloqueado else "normal")
-        listo = "disabled" if bloqueado or not self.cargado else "normal"
+        listo = "disabled" if bloqueado or not self.cargado or self.grabando else "normal"
         for boton in (self.boton_enviar, self.boton_todas, self.boton_ninguna):
             boton.configure(state=listo)
 
@@ -614,6 +703,7 @@ class VentanaCliente(tk.Tk):
         self.emisor = None
         self.boton_cancelar.configure(state="disabled")
         self._bloquear(False)
+        self.boton_rec.configure(state="normal")
 
     def _al_progresar(self, actual, total):
         self.barra_envio.configure(maximum=total, value=actual)
@@ -642,6 +732,217 @@ class VentanaCliente(tk.Tk):
         self._terminar_envio()
         self.barra_envio.configure(value=0)
         self.etiqueta_envio.configure(text="Envío cancelado. Puede volver a intentarlo.", foreground=SUAVE)
+
+    # --- Pestaña Sensor Arduino (puerto serie -> gráficos -> REC/STOP -> servidor) ---
+
+    # Propósito: tarjeta con puerto, conexión, minidashboard (oculto hasta conectar) y REC/STOP.
+    def _crear_paso_arduino(self, padre):
+        tarjeta = Tarjeta(padre, "Sensor Arduino")
+        tarjeta.pack(fill="x", pady=(0, 12))
+        fila = ttk.Frame(tarjeta, style="Tarjeta.TFrame")
+        fila.pack(fill="x")
+        ttk.Label(fila, text="Puerto", style="Suave.TLabel").pack(side="left")
+        self.combo_puerto = ttk.Combobox(fila, state="readonly", width=12)
+        self.combo_puerto.pack(side="left", padx=6)
+        self.boton_buscar = ttk.Button(fila, text="Buscar", command=self.buscar_puertos)
+        self.boton_buscar.pack(side="left")
+        self.boton_conectar = ttk.Button(fila, text="Conectar Arduino", style="Acento.TButton",
+                                         command=self.alternar_arduino)
+        self.boton_conectar.pack(side="left", padx=8)
+        self.etiqueta_arduino = ttk.Label(fila, text="Sin conexión", style="Suave.TLabel")
+        self.etiqueta_arduino.pack(side="left")
+
+        # Minidashboard: aparece al conectar. Un gráfico por magnitud, cada uno con su escala.
+        self.panel_sensor = ttk.Frame(tarjeta, style="Tarjeta.TFrame")
+        graficos = ttk.Frame(self.panel_sensor, style="Tarjeta.TFrame")
+        graficos.pack(fill="x", pady=(10, 0))
+        self.graficos = {
+            "temperatura": GraficoLinea(graficos, "Temperatura", "°C", "#B45309", span_minimo=2, alto=170),
+            "humedad": GraficoLinea(graficos, "Humedad", "%", ACENTO, span_minimo=5, alto=170),
+            "gas": GraficoLinea(graficos, "Gas", "", "#6D28D9", span_minimo=50, decimales=0, alto=170),
+        }
+        for i, grafico in enumerate(self.graficos.values()):
+            graficos.columnconfigure(i, weight=1, uniform="g")
+            grafico.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0))
+
+        control = ttk.Frame(self.panel_sensor, style="Tarjeta.TFrame")
+        control.pack(fill="x", pady=(10, 0))
+        ttk.Label(control, text="Captura", style="Suave.TLabel").pack(side="left")
+        self.combo_tasa = ttk.Combobox(control, state="readonly", width=19,
+                                       values=list(sensor_arduino.TASAS))
+        self.combo_tasa.set("1 dato por segundo")
+        self.combo_tasa.pack(side="left", padx=6)
+        self.boton_rec = ttk.Button(control, text="● REC", style="Peligro.TButton",
+                                    command=self.iniciar_grabacion)
+        self.boton_rec.pack(side="left", padx=(6, 0))
+        self.boton_stop = ttk.Button(control, text="■ STOP", command=self.detener_grabacion,
+                                     state="disabled")
+        self.boton_stop.pack(side="left", padx=6)
+        self.etiqueta_rec = ttk.Label(control, text="", style="Suave.TLabel")
+        self.etiqueta_rec.pack(side="left", padx=6)
+        self.buscar_puertos()
+
+    # Propósito: datos de red y avance del envío de la pestaña Arduino.
+    # Comparte IP y puerto con la pestaña CSV (mismas variables) y duplica barra, estado y cancelar
+    # envolviéndolos en Espejo, para que el envío se vea igual desde cualquiera de las dos.
+    def _crear_servidor_arduino(self, padre):
+        tarjeta = Tarjeta(padre, "Servidor")
+        tarjeta.pack(fill="x")
+        red = ttk.Frame(tarjeta, style="Tarjeta.TFrame")
+        red.pack(fill="x", pady=(0, 8))
+        ttk.Label(red, text="IP", style="Suave.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Entry(red, textvariable=self.var_ip, width=16).grid(row=0, column=1, padx=(6, 12))
+        ttk.Label(red, text="Puerto", style="Suave.TLabel").grid(row=0, column=2, sticky="w")
+        ttk.Entry(red, textvariable=self.var_puerto, width=7).grid(row=0, column=3, padx=(6, 12))
+        cancelar = ttk.Button(red, text="Cancelar envío", style="Peligro.TButton",
+                              command=self.cancelar_envio, state="disabled")
+        cancelar.grid(row=0, column=4)
+        barra = ttk.Progressbar(tarjeta, mode="determinate")
+        barra.pack(fill="x", pady=(2, 4))
+        etiqueta = ttk.Label(tarjeta, text="Al pulsar STOP, lo grabado se envía a este servidor.",
+                             style="Suave.TLabel", wraplength=700)
+        etiqueta.pack(anchor="w")
+        self.boton_cancelar = Espejo(self.boton_cancelar, cancelar)
+        self.barra_envio = Espejo(self.barra_envio, barra)
+        self.etiqueta_envio = Espejo(self.etiqueta_envio, etiqueta)
+
+    # Propósito: llenar la lista de puertos serie (si falta pyserial, avisarlo en la tarjeta).
+    def buscar_puertos(self):
+        try:
+            puertos = sensor_arduino.listar_puertos()
+        except sensor_arduino.ErrorSensor as error:
+            self.etiqueta_arduino.configure(text=f"✖ {error}", foreground=ERROR)
+            return
+        self.combo_puerto.configure(values=puertos)
+        if puertos and self.combo_puerto.get() not in puertos:
+            self.combo_puerto.set(puertos[0])
+        self.etiqueta_arduino.configure(
+            text="" if puertos else "No se detectó ningún Arduino.", foreground=SUAVE)
+
+    def alternar_arduino(self):
+        if self.lector is None:
+            self.conectar_arduino()
+        else:
+            self.desconectar_arduino()
+
+    # Propósito: abrir el puerto y mostrar el minidashboard. El hilo lector solo deja tareas en la cola.
+    def conectar_arduino(self):
+        puerto = self.combo_puerto.get()
+        if not puerto:
+            self.etiqueta_arduino.configure(text="⚠ Elija un puerto (o pulse Buscar).", foreground=ERROR)
+            return
+        lector = sensor_arduino.LectorSerial(
+            puerto,
+            al_lectura=lambda lectura: self.cola.put(lambda: self._al_lectura(lector, lectura)),
+            al_error=lambda texto: self.cola.put(lambda: self._al_error_arduino(lector, texto)))
+        try:
+            lector.iniciar()
+        except sensor_arduino.ErrorSensor as error:
+            self.etiqueta_arduino.configure(text=f"✖ {error}", foreground=ERROR)
+            return
+        self.lector = lector
+        self.boton_conectar.configure(text="Desconectar")
+        self.combo_puerto.configure(state="disabled")
+        self.boton_buscar.configure(state="disabled")
+        self.etiqueta_arduino.configure(text=f"Conectado a {puerto}. Esperando datos…", foreground=SUAVE)
+        self.panel_sensor.pack(fill="x")
+
+    # Propósito: cerrar el puerto y ocultar el dashboard. Si se grababa, se descarta sin enviar.
+    def desconectar_arduino(self, texto="Sin conexión"):
+        self._parar_muestreo()
+        self.grabando = False
+        self.boton_rec.configure(state="normal" if self.emisor is None else "disabled")
+        self.boton_stop.configure(state="disabled")
+        self.combo_tasa.configure(state="readonly")
+        self.etiqueta_rec.configure(text="")
+        if self.lector is not None:
+            self.lector.detener()
+            self.lector = None
+        for grafico in self.graficos.values():
+            grafico.limpiar()
+        self.panel_sensor.pack_forget()
+        self.boton_conectar.configure(text="Conectar Arduino")
+        self.combo_puerto.configure(state="readonly")
+        self.boton_buscar.configure(state="normal")
+        self.etiqueta_arduino.configure(text=texto, foreground=SUAVE)
+        self._bloquear(self.emisor is not None)
+
+    # Propósito: (cola) llegó una lectura nueva: actualizar los tres gráficos.
+    def _al_lectura(self, lector, lectura):
+        if lector is not self.lector:      # lectura de una conexión ya cerrada
+            return
+        for campo, grafico in self.graficos.items():
+            grafico.agregar(lectura[campo])
+        if not self.grabando:
+            self.etiqueta_arduino.configure(text=f"● Recibiendo de {lector.puerto}", foreground=EXITO)
+
+    def _al_error_arduino(self, lector, texto):
+        if lector is self.lector:
+            self.desconectar_arduino(f"✖ {texto}")
+
+    # Propósito: REC. Valida antes la red (para no grabar y fallar al final) y arranca el muestreo.
+    def iniciar_grabacion(self):
+        host, texto_puerto = self.var_ip.get().strip(), self.var_puerto.get().strip()
+        if not host or not texto_puerto.isdigit() or not 0 < int(texto_puerto) < 65536:
+            self.etiqueta_rec.configure(text="⚠ Revise la IP y el puerto del paso 4.", foreground=ERROR)
+            return
+        if self.emisor is not None:
+            self.etiqueta_rec.configure(text="⚠ Hay un envío en curso.", foreground=ERROR)
+            return
+        self.grabadora = sensor_arduino.Grabadora()
+        self.grabando = True
+        self.boton_rec.configure(state="disabled")
+        self.boton_stop.configure(state="normal")
+        self.combo_tasa.configure(state="disabled")
+        self._bloquear(False)             # mientras se graba, el envío del CSV queda deshabilitado
+        self._tomar_muestra()
+
+    # Propósito: guardar una fila con la última lectura vigente y reprogramarse según la tasa elegida.
+    def _tomar_muestra(self):
+        if not self.grabando:
+            return
+        self.grabadora.muestrear(self.lector.ultima() if self.lector else None)
+        self.etiqueta_rec.configure(
+            text=f"● Grabando · {miles(len(self.grabadora.registros))} filas", foreground=ERROR)
+        intervalo = sensor_arduino.TASAS[self.combo_tasa.get()]
+        self._id_muestreo = self.after(int(intervalo * 1000), self._tomar_muestra)
+
+    def _parar_muestreo(self):
+        if self._id_muestreo is not None:
+            self.after_cancel(self._id_muestreo)
+            self._id_muestreo = None
+
+    # Propósito: STOP. Detiene la captura y envía TODO lo grabado en una sola conexión.
+    # Por qué: el servidor reemplaza su tabla en cada conexión y corta cada una a los 600 s;
+    # enviar al final evita ambas limitaciones sin cambiar el contrato (JSON + <EOF>).
+    def detener_grabacion(self):
+        self._parar_muestreo()
+        self.grabando = False
+        self.boton_stop.configure(state="disabled")
+        self.combo_tasa.configure(state="readonly")
+        registros = self.grabadora.registros
+        if not registros:
+            self.boton_rec.configure(state="normal")
+            self.etiqueta_rec.configure(text="⚠ No se grabó ninguna fila (¿el sensor envía datos?).",
+                                        foreground=ERROR)
+            self._bloquear(self.emisor is not None)
+            return
+        self.etiqueta_rec.configure(text=f"■ Detenido · {miles(len(registros))} filas", foreground=SUAVE)
+        self.barra_envio.configure(value=0)
+        self.etiqueta_envio.configure(text="Conectando con el servidor…", foreground=SUAVE)
+        self._bloquear(True)
+        self.boton_cancelar.configure(state="normal")
+        self.emisor = EmisorTCP()
+        threading.Thread(target=self._tarea_enviar,
+                         args=(self.emisor, pd.DataFrame(registros), self.var_ip.get().strip(),
+                               int(self.var_puerto.get()), 1000), daemon=True).start()
+
+    # Propósito: al cerrar la ventana, liberar el puerto serie.
+    def _cerrar(self):
+        self._parar_muestreo()
+        if self.lector is not None:
+            self.lector.detener()
+        self.destroy()
 
     # --- Comunicación entre hilos ---------------------------------------------
 

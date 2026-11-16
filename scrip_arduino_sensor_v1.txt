@@ -1,0 +1,30 @@
+#include <DHT.h>
+
+#define DHTPIN 2       // Pin digital 2 donde va tu cable amarillo (datos)
+#define DHTTYPE DHT11  // Cambiado a DHT11 (el sensor azul de tu foto)[cite: 19, 20]
+
+DHT dht(DHTPIN, DHTTYPE);
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+}
+
+void loop() {
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+  int gas = 0; // Valor neutro mientras no conectes el sensor MQ-2
+
+  if (isnan(temp) || isnan(hum)) {
+    Serial.println("ERROR_LECTURA");
+  } else {
+    // Envía formato CSV limpio: Temperatura,Humedad,Gas
+    Serial.print(temp, 1);
+    Serial.print(",");
+    Serial.print(hum, 1);
+    Serial.print(",");
+    Serial.println(gas);
+  }
+
+  delay(2000); // Envía datos cada 2 segundos
+}
