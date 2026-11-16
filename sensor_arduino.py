@@ -16,7 +16,8 @@ BAUDIOS = 9600                 # debe coincidir con Serial.begin() del Arduino
 MAX_EDAD_LECTURA = 6.0         # s: una lectura más vieja no se graba (sensor caído o desconectado)
 
 # Tres alternativas de captura: nombre en pantalla -> segundos entre muestras.
-TASAS = {"1 dato cada 5 s": 5.0, "1 dato por segundo": 1.0, "2 datos por segundo": 0.5}
+# El Arduino debe enviar al menos a 5 líneas/s (ver scrip_arduino_sensor_v2.txt).
+TASAS = {"1 dato por segundo": 1.0, "2 datos por segundo": 0.5, "5 datos por segundo": 0.2}
 
 # Rangos admitidos: lo que llega por serie no es de confianza (ruido, línea corrupta).
 RANGOS = {"temperatura": (-40.0, 80.0), "humedad": (0.0, 100.0), "gas": (0.0, 1023.0)}

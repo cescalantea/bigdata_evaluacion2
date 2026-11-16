@@ -104,10 +104,10 @@ def test_grabadora_guarda_filas_y_omite_si_no_hay_lectura():
 
 
 def test_las_tres_tasas_pedidas():
-    assert sorted(sensor_arduino.TASAS.values()) == [0.5, 1.0, 5.0]
+    assert sorted(sensor_arduino.TASAS.values()) == [0.2, 0.5, 1.0]
 
 
-# --- Ventana: REC -> STOP -> servidor ---------------------------------------------------
+# --- Ventana: Iniciar -> Detener transmisión -> servidor ---------------------------------------------------
 
 class LectorFalso:
     puerto = "COM_FALSO"
@@ -145,7 +145,7 @@ def test_rec_stop_envia_las_filas_al_servidor(ventana):
     v.var_puerto.set(str(escucha.getsockname()[1]))
     v.lector = LectorFalso()
     v.iniciar_grabacion()                 # toma la 1ª muestra de inmediato
-    assert v.grabando and str(v.boton_stop.cget("state")) == "normal"
+    assert v.grabando and str(v.boton_detener.cget("state")) == "normal"
     v._parar_muestreo()
     v._tomar_muestra()                    # 2ª y 3ª muestra sin esperar el reloj
     v._parar_muestreo()

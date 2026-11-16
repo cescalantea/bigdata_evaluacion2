@@ -305,7 +305,7 @@ class GraficoLinea(tk.Canvas):
     Guarda los últimos 'maximo' puntos y se redibuja al recibir uno o al cambiar de tamaño.
     """
 
-    def __init__(self, padre, titulo, unidad, color, span_minimo, decimales=1, maximo=90, alto=108):
+    def __init__(self, padre, titulo, unidad, color, span_minimo, decimales=1, maximo=150, alto=108):
         super().__init__(padre, bg=TARJETA, height=alto, highlightthickness=1,
                          highlightbackground="#E3E8ED")
         self.titulo, self.unidad, self.color = titulo, unidad, color
@@ -370,7 +370,7 @@ class VentanaCliente(tk.Tk):
         self.cola = queue.Queue()         # los hilos dejan aquí tareas para la GUI
         self.cargado = False
         self.lector = None                # LectorSerial mientras el Arduino está conectado
-        self.grabadora = None             # Grabadora mientras se graba (REC)
+        self.grabadora = None             # Grabadora mientras se transmite
         self.grabando = False
         self._id_muestreo = None          # id del after() que toma las muestras
 
@@ -703,7 +703,7 @@ class VentanaCliente(tk.Tk):
         self.emisor = None
         self.boton_cancelar.configure(state="disabled")
         self._bloquear(False)
-        self.boton_rec.configure(state="normal")
+        self.boton_iniciar.configure(state="normal")
 
     def _al_progresar(self, actual, total):
         self.barra_envio.configure(maximum=total, value=actual)
@@ -733,9 +733,9 @@ class VentanaCliente(tk.Tk):
         self.barra_envio.configure(value=0)
         self.etiqueta_envio.configure(text="Envío cancelado. Puede volver a intentarlo.", foreground=SUAVE)
 
-    # --- Pestaña Sensor Arduino (puerto serie -> gráficos -> REC/STOP -> servidor) ---
+    # --- Pestaña Sensor Arduino (puerto serie -> gráficos -> transmisión -> servidor) ---
 
-    # Propósito: tarjeta con puerto, conexión, minidashboard (oculto hasta conectar) y REC/STOP.
+    # Propósito: tarjeta con puerto, conexión, minidashboard (oculto hasta conectar) e Iniciar/Detener transmisión.
     def _crear_paso_arduino(self, padre):
         tarjeta = Tarjeta(padre, "Sensor Arduino")
         tarjeta.pack(fill="x", pady=(0, 12))
@@ -772,12 +772,12 @@ class VentanaCliente(tk.Tk):
                                        values=list(sensor_arduino.TASAS))
         self.combo_tasa.set("1 dato por segundo")
         self.combo_tasa.pack(side="left", padx=6)
-        self.boton_rec = ttk.Button(control, text="● REC", style="Peligro.TButton",
-                                    command=self.iniciar_grabacion)
-        self.boton_rec.pack(side="left", padx=(6, 0))
-        self.boton_stop = ttk.Button(control, text="■ STOP", command=self.detener_grabacion,
-                                     state="disabled")
-        self.boton_stop.pack(side="left", padx=6)
+        self.boton_iniciar = ttk.Button(control, text="▶ Iniciar transmisión", style="Acento.TButton",
+                                        command=self.iniciar_grabacion)
+        self.boton_iniciar.pack(side="left", padx=(6, 0))
+        self.boton_detener = ttk.Button(control, text="■ Detener transmisión", style="Peligro.TButton",
+                                        command=self.detener_grabacion, state="disabled")
+        self.boton_detener.pack(side="left", padx=6)
         self.etiqueta_rec = ttk.Label(control, text="", style="Suave.TLabel")
         self.etiqueta_rec.pack(side="left", padx=6)
         self.buscar_puertos()
@@ -799,7 +799,7 @@ class VentanaCliente(tk.Tk):
         cancelar.grid(row=0, column=4)
         barra = ttk.Progressbar(tarjeta, mode="determinate")
         barra.pack(fill="x", pady=(2, 4))
-        etiqueta = ttk.Label(tarjeta, text="Al pulsar STOP, lo grabado se envía a este servidor.",
+        etiqueta = ttk.Label(tarjeta, text="Al detener la transmisión, lo capturado se envía a este servidor.",
                              style="Suave.TLabel", wraplength=700)
         etiqueta.pack(anchor="w")
         self.boton_cancelar = Espejo(self.boton_cancelar, cancelar)
@@ -851,8 +851,8 @@ class VentanaCliente(tk.Tk):
     def desconectar_arduino(self, texto="Sin conexión"):
         self._parar_muestreo()
         self.grabando = False
-        self.boton_rec.configure(state="normal" if self.emisor is None else "disabled")
-        self.boton_stop.configure(state="disabled")
+        self.boton_iniciar.configure(state="normal" if self.emisor is None else "disabled")
+        self.boton_detener.configure(state="disabled")
         self.combo_tasa.configure(state="readonly")
         self.etiqueta_rec.configure(text="")
         if self.lector is not None:
@@ -880,7 +880,7 @@ class VentanaCliente(tk.Tk):
         if lector is self.lector:
             self.desconectar_arduino(f"✖ {texto}")
 
-    # Propósito: REC. Valida antes la red (para no grabar y fallar al final) y arranca el muestreo.
+    # Propósito: Iniciar transmisión. Valida antes la red (para no capturar y fallar al final) y arranca el muestreo.
     def iniciar_grabacion(self):
         host, texto_puerto = self.var_ip.get().strip(), self.var_puerto.get().strip()
         if not host or not texto_puerto.isdigit() or not 0 < int(texto_puerto) < 65536:
@@ -891,8 +891,8 @@ class VentanaCliente(tk.Tk):
             return
         self.grabadora = sensor_arduino.Grabadora()
         self.grabando = True
-        self.boton_rec.configure(state="disabled")
-        self.boton_stop.configure(state="normal")
+        self.boton_iniciar.configure(state="disabled")
+        self.boton_detener.configure(state="normal")
         self.combo_tasa.configure(state="disabled")
         self._bloquear(False)             # mientras se graba, el envío del CSV queda deshabilitado
         self._tomar_muestra()
@@ -903,7 +903,7 @@ class VentanaCliente(tk.Tk):
             return
         self.grabadora.muestrear(self.lector.ultima() if self.lector else None)
         self.etiqueta_rec.configure(
-            text=f"● Grabando · {miles(len(self.grabadora.registros))} filas", foreground=ERROR)
+            text=f"● Transmitiendo · {miles(len(self.grabadora.registros))} filas", foreground=ERROR)
         intervalo = sensor_arduino.TASAS[self.combo_tasa.get()]
         self._id_muestreo = self.after(int(intervalo * 1000), self._tomar_muestra)
 
@@ -912,18 +912,18 @@ class VentanaCliente(tk.Tk):
             self.after_cancel(self._id_muestreo)
             self._id_muestreo = None
 
-    # Propósito: STOP. Detiene la captura y envía TODO lo grabado en una sola conexión.
+    # Propósito: Detener transmisión. Detiene la captura y envía TODO lo capturado en una sola conexión.
     # Por qué: el servidor reemplaza su tabla en cada conexión y corta cada una a los 600 s;
     # enviar al final evita ambas limitaciones sin cambiar el contrato (JSON + <EOF>).
     def detener_grabacion(self):
         self._parar_muestreo()
         self.grabando = False
-        self.boton_stop.configure(state="disabled")
+        self.boton_detener.configure(state="disabled")
         self.combo_tasa.configure(state="readonly")
         registros = self.grabadora.registros
         if not registros:
-            self.boton_rec.configure(state="normal")
-            self.etiqueta_rec.configure(text="⚠ No se grabó ninguna fila (¿el sensor envía datos?).",
+            self.boton_iniciar.configure(state="normal")
+            self.etiqueta_rec.configure(text="⚠ No se capturó ninguna fila (¿el sensor envía datos?).",
                                         foreground=ERROR)
             self._bloquear(self.emisor is not None)
             return
