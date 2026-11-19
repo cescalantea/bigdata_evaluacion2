@@ -24,7 +24,6 @@ import time
 import logging
 import math
 import uuid
-from datetime import datetime, timezone
 import tkinter as tk
 from tkinter import ttk
 import pandas as pd
@@ -340,11 +339,16 @@ class MongoRepositorio:
         self.uri = os.environ.get("MONGODB_URI", "").strip()
         self.nombre_bd = os.environ.get("MONGODB_DB", "bigdata_eval3").strip()
         self.coleccion_csv = os.environ.get("MONGODB_COLLECTION_CSV", "datos_csv").strip()
-        self.coleccion_sensores = os.environ.get("MONGODB_COLLECTION_SENSORES", "sensores").strip()
         self.tamano_lote = int(os.environ.get("MONGODB_BATCH_SIZE", "1000"))
         self.timeout_ms = int(os.environ.get("MONGODB_TIMEOUT_MS", "5000"))
-        if self.tamano_lote <= 0 or self.timeout_ms <= 0:
-            raise ValueError("MONGODB_BATCH_SIZE y MONGODB_TIMEOUT_MS deben ser positivos.")
+        self.max_intentos = int(os.environ.get("MONGODB_MAX_ATTEMPTS", "3"))
+        self.delay_reintento = float(os.environ.get("MONGODB_RETRY_DELAY", "2"))
+        if (self.tamano_lote <= 0 or self.timeout_ms <= 0 or
+                self.max_intentos <= 0 or self.delay_reintento < 0):
+            raise ValueError(
+                "MONGODB_BATCH_SIZE, MONGODB_TIMEOUT_MS y MONGODB_MAX_ATTEMPTS "
+                "deben ser positivos; MONGODB_RETRY_DELAY no puede ser negativo."
+            )
         self._cliente = None
         self._db = None
         self._conexion_lock = threading.Lock()
@@ -355,28 +359,49 @@ class MongoRepositorio:
         return bool(self.uri)
 
     def conectar(self):
-        """Abre la conexion y comprueba que Atlas responda."""
+        """Comprueba MongoDB y reintenta con espera ante errores de conexion."""
         if not self.habilitado:
             return False
+        try:
+            from pymongo import MongoClient
+            from pymongo.errors import PyMongoError
+        except ImportError as error:
+            raise RuntimeError(
+                "Falta pymongo. Ejecute: python -m pip install -r requirements.txt"
+            ) from error
+
         with self._conexion_lock:
-            if self._cliente is not None:
-                return True
-            try:
-                from pymongo import MongoClient
-                self._cliente = MongoClient(self.uri, serverSelectionTimeoutMS=self.timeout_ms)
-                self._cliente.admin.command("ping")
-                self._db = self._cliente[self.nombre_bd]
-                return True
-            except ImportError as error:
+            ultimo_error = None
+            for intento in range(1, self.max_intentos + 1):
+                try:
+                    if self._cliente is None:
+                        self._cliente = MongoClient(
+                            self.uri, serverSelectionTimeoutMS=self.timeout_ms
+                        )
+                    self._cliente.admin.command("ping")
+                    self._db = self._cliente[self.nombre_bd]
+                    if intento > 1:
+                        logging.info("MongoDB reconectado en el intento %s.", intento)
+                    return True
+                except PyMongoError as error:
+                    ultimo_error = error
+                    nivel = logging.warning if intento < self.max_intentos else logging.error
+                    nivel(
+                        "MongoDB no responde (intento %s/%s): %s",
+                        intento, self.max_intentos, error,
+                    )
+                    if self._cliente is not None:
+                        self._cliente.close()
+                    self._cliente = None
+                    self._db = None
+                    if intento < self.max_intentos:
+                        time.sleep(self.delay_reintento)
+
+            if ultimo_error is not None:
                 raise RuntimeError(
-                    "Falta pymongo. Ejecute: python -m pip install -r requirements.txt"
-                ) from error
-            except Exception:
-                if self._cliente is not None:
-                    self._cliente.close()
-                self._cliente = None
-                self._db = None
-                raise
+                    f"No se pudo conectar con MongoDB tras {self.max_intentos} intentos."
+                ) from ultimo_error
+            raise RuntimeError("No se pudo establecer la conexion con MongoDB.")
 
     @staticmethod
     def _valor_mongo(valor):
@@ -399,7 +424,7 @@ class MongoRepositorio:
         return valor
 
     def guardar_dataframe(self, dataframe, transferencia_id=None):
-        """Guarda filas del CSV con insert_many, sin un insert por fila."""
+        """Guarda cada fila con las columnas CSV como campos del documento."""
         if not self.habilitado:
             return {"habilitado": False, "insertados": 0, "transferencia_id": None}
         if dataframe is None:
@@ -408,38 +433,25 @@ class MongoRepositorio:
         transferencia_id = transferencia_id or uuid.uuid4().hex
         coleccion = self._db[self.coleccion_csv]
         insertados = 0
-        documentos = []
-        recibido_en = datetime.now(timezone.utc)
-        for numero_fila, fila in enumerate(dataframe.to_dict("records"), start=1):
-            documentos.append({
-                "transfer_id": transferencia_id,
-                "row_number": numero_fila,
-                "data": {str(clave): self._valor_mongo(valor) for clave, valor in fila.items()},
-                "received_at": recibido_en,
-            })
-            if len(documentos) >= self.tamano_lote:
+        from pymongo.errors import PyMongoError
+        try:
+            for inicio in range(0, len(dataframe), self.tamano_lote):
+                filas = dataframe.iloc[inicio:inicio + self.tamano_lote].to_dict("records")
+                documentos = [
+                    {
+                        str(clave): self._valor_mongo(valor)
+                        for clave, valor in fila.items()
+                    }
+                    for fila in filas
+                ]
                 coleccion.insert_many(documentos, ordered=False)
                 insertados += len(documentos)
-                documentos.clear()
-        if documentos:
-            coleccion.insert_many(documentos, ordered=False)
-            insertados += len(documentos)
+        except PyMongoError as error:
+            logging.exception("MongoDB no confirmo un lote de datos CSV.")
+            raise RuntimeError(
+                "MongoDB no confirmo la escritura del lote CSV; revise la conexion."
+            ) from error
         return {"habilitado": True, "insertados": insertados, "transferencia_id": transferencia_id}
-
-    def guardar_sensor(self, temperatura, humedad=None, gas=None, fecha_hora=None):
-        """Guarda una lectura IoT; queda listo para el protocolo SENSOR."""
-        if not self.habilitado:
-            return {"habilitado": False, "insertados": 0}
-        self.conectar()
-        documento = {
-            "type": "SENSOR",
-            "fecha_hora": fecha_hora or datetime.now(timezone.utc),
-            "temperatura": self._valor_mongo(temperatura),
-            "humedad": self._valor_mongo(humedad),
-            "gas": self._valor_mongo(gas),
-        }
-        self._db[self.coleccion_sensores].insert_one(documento)
-        return {"habilitado": True, "insertados": 1}
 
     def cerrar(self):
         """Cierra el cliente MongoDB al salir de la aplicacion."""
@@ -932,7 +944,16 @@ class ServidorBigData(tk.Tk):
                             self._mostrar_estado_datos(
                                 f"● Datos recibidos: {miles(len(self.df_recibido))} registros. "
                                 f"MongoDB: {miles(persistencia['insertados'])} guardados.", EXITO)
-                        self._mostrar_estado("● Recepción completada. Servidor a la escucha.", EXITO)
+                            self._mostrar_estado(
+                                "● Recepción completada. Servidor a la escucha.", EXITO)
+                        else:
+                            self._mostrar_estado_datos(
+                                f"● Datos recibidos: {miles(len(self.df_recibido))} registros. "
+                                "MongoDB no configurado; no se guardaron.", AVISO)
+                            self._mostrar_estado(
+                                "● CSV recibido solo en memoria; configure MongoDB para guardarlo.",
+                                AVISO,
+                            )
                         resultado.update(ok=True, filas=len(df_nuevo))
                     except Exception as error:
                         self.df_recibido, self.df_actual, self.pagina_actual = anterior
@@ -991,7 +1012,7 @@ class ServidorBigData(tk.Tk):
                 self._hilos_clientes.discard(hilo_actual)
 
     def _atender_sensor(self, mensaje, conexion):
-        """Valida, persiste y confirma una lectura sin bloquear el CSV."""
+        """Valida y confirma una lectura sin persistir datos Arduino."""
         try:
             temperatura = mensaje.get("temperature", mensaje.get("temp"))
             humedad = mensaje.get("humidity", mensaje.get("hum"))
@@ -1005,10 +1026,6 @@ class ServidorBigData(tk.Tk):
             raise ValueError(f"Lectura SENSOR invalida: {error}") from error
         if not all(math.isfinite(valor) for valor in valores.values()):
             raise ValueError("La lectura SENSOR contiene un numero no finito.")
-        persistencia = self.mongo.guardar_sensor(
-            valores["temperatura"], valores["humedad"], valores["gas"],
-            mensaje.get("timestamp", mensaje.get("fecha_hora"))
-        )
         with self._sensores_lock:
             self._sensores_recibidos += 1
             total = self._sensores_recibidos
@@ -1016,13 +1033,13 @@ class ServidorBigData(tk.Tk):
             responder_linea(conexion, {
                 "ok": True,
                 "type": "SENSOR_ACK",
-                "persisted": persistencia["habilitado"],
+                "persisted": False,
                 "sensores": total,
             })
         except OSError:
             pass
         self.cola.put(lambda total=total: self._mostrar_estado(
-            f"● Sensor recibido: {total} lectura(s).", EXITO))
+            f"● Sensor recibido, no guardado en MongoDB: {total} lectura(s).", AVISO))
 
     def _datos_recibidos(self, df_nuevo):
         self._version_filtro += 1

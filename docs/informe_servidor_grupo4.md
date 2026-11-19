@@ -43,8 +43,8 @@ flowchart LR
 ```
 
 La separación es deliberadamente pequeña: funciones independientes para lógica
-comprobable y una clase de aplicación para presentación y coordinación. No se
-incorporaron frameworks ni infraestructura de persistencia.
+comprobable y una clase de aplicación para presentación y coordinación. La
+persistencia CSV se realiza en MongoDB cuando se configura `MONGODB_URI`.
 
 ## D. Protocolo de comunicación
 
@@ -286,8 +286,31 @@ python servidor_prueba.py
 Pulsar **Iniciar escucha** antes de enviar desde `python cliente.py` en otra
 terminal. IP y puerto también se pueden editar en la interfaz.
 
+### Persistencia CSV en MongoDB
+
+Copiar `.env.example` como `.env` y configurar una URI propia de MongoDB Atlas.
+Cada fila enviada se inserta en `datos_csv` como un documento con los nombres de
+las columnas del CSV directamente en la raíz; los valores vacíos se guardan como
+`null`. Los documentos se insertan por lotes. Las lecturas Arduino se aceptan y
+confirman por el socket, pero no se guardan en MongoDB ni se utiliza una
+colección de sensores.
+
+El servidor verifica MongoDB al guardar y realiza hasta tres intentos separados
+por dos segundos (`MONGODB_MAX_ATTEMPTS` y `MONGODB_RETRY_DELAY`). Si la conexión
+no se recupera, o MongoDB no confirma un lote, la transferencia se informa como
+fallida en el ACK y en el registro del servidor; no se confirma una escritura
+fallida como exitosa. No se reintenta a ciegas un lote cuya escritura quedó sin
+confirmación, para evitar duplicar filas.
+
 | Variable de entorno | Predeterminado | Uso |
 |---|---:|---|
+| `MONGODB_URI` | vacío | URI de conexión a MongoDB; sin valor, la persistencia queda deshabilitada |
+| `MONGODB_DB` | `bigdata_eval3` | Base de datos MongoDB |
+| `MONGODB_COLLECTION_CSV` | `datos_csv` | Colección donde se almacenan las filas CSV |
+| `MONGODB_BATCH_SIZE` | `1000` | Filas por lote de inserción |
+| `MONGODB_TIMEOUT_MS` | `5000` | Timeout de selección del servidor, milisegundos |
+| `MONGODB_MAX_ATTEMPTS` | `3` | Intentos de conexión por operación de guardado |
+| `MONGODB_RETRY_DELAY` | `2` | Pausa entre intentos de conexión, segundos |
 | `SERVIDOR_HOST` | `127.0.0.1` | Dirección local de escucha |
 | `SERVIDOR_PUERTO` | `12345` | Puerto TCP |
 | `SERVIDOR_MAX_BYTES` | `536870912` | Payload máximo incluyendo EOF |
