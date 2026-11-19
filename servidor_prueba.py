@@ -1,17 +1,18 @@
 """
-Script para recibir datos por sockets y mostrarlos en una tabla con filtros y ordenamiento.
+Script para recibir datos por sockets y mostrarlos en una tabla con filtros,
+ordenamiento, dashboard estadístico (Matplotlib) y persistencia en MongoDB.
 Autor: Grupo 4 — Mamani, Perea, Pinedo, Vargas, Vergara.
 Licencia: solo educacional.
 Fecha creación: 16-10-2026.
-Fecha modificación: 18-10-2026.
-Modificaciones: separación de mensajes de conexión y datos, ajustes del filtro
-y ordenamiento ascendente y descendente por columna.
+Fecha modificación: 19-11-2026.
+Modificaciones: integración de doble puerto (CSV y sensores), persistencia en
+MongoDB Atlas y pestaña de Dashboard Estadístico descriptivo con Matplotlib.
 
 SERVIDOR OFICIAL (Grupo 4) - Dashboard de Ingesta Big Data.
 
 Recibe el JSON masivo enviado por el Cliente, lo carga en memoria usando Pandas,
-y lo visualiza mediante un sistema de paginación para evitar cuellos de botella.
-Incluye filtros de vista dinámicos y respeta el "Contrato de Datos".
+lo visualiza mediante paginación, genera estadísticas descriptivas con gráficos
+y persiste los datos recibidos respetando el "Contrato de Datos".
 """
 
 import json
@@ -35,6 +36,13 @@ except ImportError:  # Permite ejecutar la demo sin configurar Atlas.
 
 if load_dotenv is not None:
     load_dotenv()
+
+try:
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    MATPLOTLIB_DISPONIBLE = True
+except ImportError:
+    MATPLOTLIB_DISPONIBLE = False
 
 # ---------------------------------------------------------------------------
 # Configuración y Estilos Visuales (Homologados con el Cliente)
@@ -83,13 +91,16 @@ def decodificar(datos):
         raise ValueError("Falta la marca <EOF>: el envío quedó incompleto.")
     # Solo se elimina el sufijo: las marcas dentro de valores son datos legítimos.
     del datos[-len(marca):]
+
     def constante_invalida(valor):
         raise ValueError(f"Constante JSON no válida: {valor}")
+
     def decimal_finito(valor):
         numero = float(valor)
         if not math.isfinite(numero):
             raise ValueError("Número fuera del rango finito admitido.")
         return numero
+
     def objeto(pares):
         resultado = {}
         for clave, valor in pares:
@@ -97,9 +108,13 @@ def decodificar(datos):
                 raise ValueError(f"Columna JSON duplicada: {clave}")
             resultado[clave] = valor
         return resultado
-    registros = json.loads(datos.decode("utf-8"), parse_constant=constante_invalida,
-                           parse_float=decimal_finito,
-                           object_pairs_hook=objeto)
+
+    registros = json.loads(
+        datos.decode("utf-8"),
+        parse_constant=constante_invalida,
+        parse_float=decimal_finito,
+        object_pairs_hook=objeto,
+    )
     if not isinstance(registros, list) or not all(isinstance(r, dict) for r in registros):
         raise ValueError("El JSON debe ser una lista de objetos.")
     return registros
@@ -190,8 +205,12 @@ def recibir_contrato(conexion, detener=None, on_sensor=None):
     def procesar_linea(linea):
         nonlocal csv_iniciado, csv_finalizado, sensores
         try:
-            mensaje = json.loads(linea.decode("utf-8"), parse_constant=lambda valor: (_ for _ in ()).throw(
-                ValueError(f"Constante JSON no valida: {valor}")))
+            mensaje = json.loads(
+                linea.decode("utf-8"),
+                parse_constant=lambda valor: (_ for _ in ()).throw(
+                    ValueError(f"Constante JSON no valida: {valor}")
+                ),
+            )
         except (UnicodeError, json.JSONDecodeError, ValueError) as error:
             raise ValueError(f"Mensaje tipado invalido: {error}") from error
         if not isinstance(mensaje, dict):
@@ -429,20 +448,188 @@ class MongoRepositorio:
             self._cliente = None
             self._db = None
 
+
 FONDO, TARJETA, TEXTO, SUAVE = "#EEF2F5", "#FFFFFF", "#1F2A37", "#6B7785"
 ACENTO, ACENTO_OSCURO, EXITO, ERROR, AVISO = "#0E7490", "#155E75", "#15803D", "#B91C1C", "#B45309"
 FUENTE = "Segoe UI"
 
-# Función de formato
+
 def miles(numero):
     return f"{numero:,}".replace(",", ".")
 
+
 class Tarjeta(ttk.Frame):
     """Panel blanco con título reutilizable."""
+
     def __init__(self, padre, titulo):
         super().__init__(padre, style="Tarjeta.TFrame", padding=14)
         if titulo:
             ttk.Label(self, text=titulo, style="Titulo.TLabel").pack(anchor="w", pady=(0, 8))
+
+
+class DashboardEstadistico(ttk.Frame):
+    """Panel de solo consulta con estadística descriptiva y gráficos del CSV."""
+
+    def __init__(self, padre):
+        super().__init__(padre, style="Fondo.TFrame", padding=(0, 8, 0, 0))
+        self._canvas = None
+        self._crear_interfaz()
+
+    def _crear_interfaz(self):
+        # 1. Tarjeta superior: KPIs generales y estado
+        panel_kpi = Tarjeta(self, "Resumen Estadístico del CSV (Solo consulta)")
+        panel_kpi.pack(fill="x", pady=(0, 10))
+
+        self.lbl_resumen = tk.Label(
+            panel_kpi,
+            text="Esperando la recepción de un archivo CSV para calcular estadísticas...",
+            bg=TARJETA, fg=SUAVE, font=(FUENTE, 10, "bold"), anchor="w"
+        )
+        self.lbl_resumen.pack(fill="x")
+
+        # 2. Tabla de medidas descriptivas por columna numérica
+        panel_stats = Tarjeta(self, "Medidas Básicas por Variable Numérica")
+        panel_stats.pack(fill="x", pady=(0, 10))
+
+        cols = ("Columna", "Válidos", "Promedio", "Mínimo", "Máximo", "Desv. Est.")
+        self.tabla_stats = ttk.Treeview(panel_stats, columns=cols, show="headings", height=4)
+        for col in cols:
+            self.tabla_stats.heading(col, text=col)
+            self.tabla_stats.column(col, width=130, anchor="center")
+        self.tabla_stats.pack(fill="x")
+
+        # 3. Contenedor para los 2 gráficos de Matplotlib
+        self.panel_graficos = Tarjeta(self, "Visualización de Distribución y Frecuencias")
+        self.panel_graficos.pack(fill="both", expand=True)
+
+        if not MATPLOTLIB_DISPONIBLE:
+            tk.Label(
+                self.panel_graficos,
+                text="Instale matplotlib (pip install matplotlib) para ver los gráficos.",
+                bg=TARJETA, fg=ERROR, font=(FUENTE, 10, "bold")
+            ).pack(pady=20)
+
+    def mostrar_cargando(self):
+        self.lbl_resumen.configure(
+            text="● Calculando estadísticas descriptivas en segundo plano...", fg=AVISO
+        )
+
+    @staticmethod
+    def calcular_resumen(df):
+        """Calcula métricas y datos para gráficos fuera del hilo de Tkinter."""
+        total_filas = len(df)
+        total_cols = len(df.columns)
+        resumen_numerico = []
+        col_hist_nombre = None
+        col_hist_valores = None
+
+        # Detectar columnas numéricas (convirtiendo desde dtype=object)
+        for col in df.columns:
+            serie = pd.to_numeric(df[col], errors="coerce")
+            validos = int(serie.notna().sum())
+            if validos > 0 and (validos / max(total_filas, 1)) >= 0.5:
+                resumen_numerico.append({
+                    "columna": col,
+                    "validos": validos,
+                    "promedio": float(serie.mean()),
+                    "minimo": float(serie.min()),
+                    "maximo": float(serie.max()),
+                    "std": float(serie.std()) if validos > 1 else 0.0,
+                })
+                if col_hist_nombre is None or "caudal" in col.lower():
+                    if "id" not in col.lower():
+                        col_hist_nombre = col
+                        col_hist_valores = serie.dropna().values
+
+        # Detectar columna categórica para gráfico de frecuencias (Top 6)
+        col_cat_nombre = None
+        cat_conteos = None
+        for col in df.columns:
+            if any(r["columna"] == col for r in resumen_numerico) or "fecha" in col.lower():
+                continue
+            unicos = df[col].dropna().nunique()
+            if 1 < unicos <= 50:
+                col_cat_nombre = col
+                cat_conteos = df[col].dropna().astype(str).value_counts().head(6)
+                break
+        if col_cat_nombre is None:
+            for col in df.columns:
+                if not any(r["columna"] == col for r in resumen_numerico) and "fecha" not in col.lower():
+                    col_cat_nombre = col
+                    cat_conteos = df[col].dropna().astype(str).value_counts().head(6)
+                    break
+
+        return {
+            "total_filas": total_filas,
+            "total_cols": total_cols,
+            "numericas": resumen_numerico,
+            "hist_col": col_hist_nombre,
+            "hist_vals": col_hist_valores,
+            "cat_col": col_cat_nombre,
+            "cat_conteos": cat_conteos,
+        }
+
+    def actualizar_vista(self, datos):
+        """Dibuja las métricas y gráficos en el hilo principal de Tkinter."""
+        self.lbl_resumen.configure(
+            text=f"● Total analizado: {miles(datos['total_filas'])} registros · "
+                 f"{datos['total_cols']} columnas · {len(datos['numericas'])} variables numéricas.",
+            fg=EXITO
+        )
+
+        self.tabla_stats.delete(*self.tabla_stats.get_children())
+        for item in datos["numericas"]:
+            self.tabla_stats.insert("", "end", values=(
+                item["columna"],
+                miles(item["validos"]),
+                f"{item['promedio']:.2f}",
+                f"{item['minimo']:.2f}",
+                f"{item['maximo']:.2f}",
+                f"{item['std']:.2f}",
+            ))
+
+        if not MATPLOTLIB_DISPONIBLE:
+            return
+
+        if self._canvas is not None:
+            self._canvas.get_tk_widget().destroy()
+            self._canvas = None
+
+        fig = Figure(figsize=(9, 3.6), dpi=95, facecolor=TARJETA)
+        ax1 = fig.add_subplot(121)
+        ax2 = fig.add_subplot(122)
+
+        # Gráfico 1: Histograma de variable numérica
+        if datos["hist_col"] is not None and len(datos["hist_vals"]) > 0:
+            vals = datos["hist_vals"]
+            p98 = float(pd.Series(vals).quantile(0.98))
+            vals_plot = vals[vals <= p98] if p98 > 0 else vals
+            ax1.hist(vals_plot, bins=20, color=ACENTO, edgecolor="white", alpha=0.85)
+            ax1.set_title(f"Distribución: {datos['hist_col']} (hasta p98)", fontsize=9, fontweight="bold", color=TEXTO)
+            ax1.set_xlabel(datos["hist_col"], fontsize=8)
+            ax1.set_ylabel("Frecuencia", fontsize=8)
+            ax1.grid(axis="y", linestyle="--", alpha=0.4)
+        else:
+            ax1.text(0.5, 0.5, "Sin variables numéricas", ha="center", va="center", color=SUAVE)
+            ax1.set_axis_off()
+
+        # Gráfico 2: Barras de frecuencias por categoría
+        if datos["cat_col"] is not None and datos["cat_conteos"] is not None and len(datos["cat_conteos"]) > 0:
+            etiquetas = [e[:18] + "…" if len(e) > 18 else e for e in datos["cat_conteos"].index]
+            valores = datos["cat_conteos"].values
+            ax2.barh(etiquetas[::-1], valores[::-1], color=ACENTO_OSCURO, alpha=0.85)
+            ax2.set_title(f"Top registros por {datos['cat_col']}", fontsize=9, fontweight="bold", color=TEXTO)
+            ax2.set_xlabel("Cantidad de registros", fontsize=8)
+            ax2.grid(axis="x", linestyle="--", alpha=0.4)
+        else:
+            ax2.text(0.5, 0.5, "Sin variables categóricas", ha="center", va="center", color=SUAVE)
+            ax2.set_axis_off()
+
+        fig.tight_layout(pad=2.0)
+        self._canvas = FigureCanvasTkAgg(fig, master=self.panel_graficos)
+        self._canvas.draw()
+        self._canvas.get_tk_widget().pack(fill="both", expand=True)
+
 
 # ---------------------------------------------------------------------------
 # Ventana Principal del Servidor
@@ -505,6 +692,11 @@ class ServidorBigData(tk.Tk):
         estilo.map("Alto.TButton", background=[("active", "#991B1B"), ("disabled", "#E5B4B4")], foreground=[("disabled", "#FBF1F1")])
         estilo.configure("Treeview", rowheight=24, fieldbackground=TARJETA, borderwidth=0)
         estilo.configure("Treeview.Heading", font=(FUENTE, 9, "bold"), background="#E3E8ED")
+        estilo.configure("TNotebook", background=FONDO, borderwidth=0, tabmargins=(0, 0, 0, 0))
+        estilo.configure("TNotebook.Tab", font=(FUENTE, 10, "bold"), padding=(18, 7),
+                         background="#DDE3E9", foreground=SUAVE, borderwidth=0)
+        estilo.map("TNotebook.Tab", background=[("selected", TARJETA)],
+                   foreground=[("selected", ACENTO_OSCURO)])
 
     def _crear_widgets(self):
         # Encabezado
@@ -519,11 +711,10 @@ class ServidorBigData(tk.Tk):
         # SECCIÓN 1: Controles de Red y Estado
         panel_red = Tarjeta(cuerpo, "Control del Servidor")
         panel_red.pack(fill="x", pady=(0, 12))
-        
-        # El sub-marco permite agrupar controles con grid dentro del panel con pack.
+
         cont_red = ttk.Frame(panel_red, style="Tarjeta.TFrame")
         cont_red.pack(fill="x")
-        
+
         self.var_ip, self.var_puerto = tk.StringVar(value=HOST), tk.StringVar(value=str(PUERTO))
         self.var_puerto_sensores = tk.StringVar(value=str(PUERTO_SENSORES))
         ttk.Label(cont_red, text="IP", style="Suave.TLabel").grid(row=0, column=0, sticky="w")
@@ -538,21 +729,29 @@ class ServidorBigData(tk.Tk):
         self.boton_red = ttk.Button(cont_red, text="Iniciar escucha", style="Acento.TButton", command=self.alternar_servidor)
         self.boton_red.grid(row=0, column=4, sticky="e")
         cont_red.columnconfigure(4, weight=1)
-        
-        # La etiqueta de estado queda fuera de la cuadrícula y usa pack
+
         self.estado = tk.Label(panel_red, text="● Servidor detenido", bg=TARJETA, fg=SUAVE, font=(FUENTE, 10, "bold"), anchor="w")
         self.estado.pack(anchor="w", pady=(10, 0))
 
+        # Pestañas principales
+        self.pestanas = ttk.Notebook(cuerpo)
+        self.pestanas.pack(fill="both", expand=True)
+
+        tab_tabla = ttk.Frame(self.pestanas, style="Fondo.TFrame", padding=(0, 8, 0, 0))
+        self.dashboard = DashboardEstadistico(self.pestanas)
+        self.pestanas.add(tab_tabla, text="Tabla y Filtros (CSV)")
+        self.pestanas.add(self.dashboard, text="Dashboard Estadístico")
+
         # SECCIÓN 2: Filtros de Vista
-        panel_filtro = Tarjeta(cuerpo, "Filtro de búsqueda")
+        panel_filtro = Tarjeta(tab_tabla, "Filtro de búsqueda")
         panel_filtro.pack(fill="x", pady=(0, 12))
         controles = ttk.Frame(panel_filtro, style="Tarjeta.TFrame")
         controles.pack(fill="x")
-        
+
         ttk.Label(controles, text="Buscar texto:", style="Suave.TLabel").pack(side="left")
         self.entry_filtro = ttk.Entry(controles, width=25)
         self.entry_filtro.pack(side="left", padx=10)
-        
+
         self.btn_filtrar = ttk.Button(controles, text="Aplicar", command=self.aplicar_filtro, state="disabled")
         self.btn_filtrar.pack(side="left", padx=5)
         self.btn_limpiar = ttk.Button(controles, text="Limpiar", command=self.limpiar_filtro, state="disabled")
@@ -563,27 +762,27 @@ class ServidorBigData(tk.Tk):
         self.estado_datos.bind("<Configure>", lambda e: self.estado_datos.configure(wraplength=max(1, e.width)))
 
         # SECCIÓN 3: Paginación
-        panel_pag = ttk.Frame(cuerpo, style="Fondo.TFrame")
+        panel_pag = ttk.Frame(tab_tabla, style="Fondo.TFrame")
         panel_pag.pack(fill="x", pady=(0, 5))
-        
+
         self.btn_anterior = ttk.Button(panel_pag, text="<< Anterior", command=self.pagina_anterior, state="disabled")
         self.btn_anterior.pack(side="left")
-        
+
         self.lbl_pagina = tk.Label(panel_pag, text="Esperando datos...", bg=FONDO, fg=TEXTO, font=(FUENTE, 10, "bold"))
         self.lbl_pagina.pack(side="left", padx=15)
-        
+
         self.btn_siguiente = ttk.Button(panel_pag, text="Siguiente >>", command=self.pagina_siguiente, state="disabled")
         self.btn_siguiente.pack(side="left")
 
-        # SECCIÓN 4: Dashboard (Treeview)
-        panel_tabla = Tarjeta(cuerpo, "")
+        # SECCIÓN 4: Tabla (Treeview)
+        panel_tabla = Tarjeta(tab_tabla, "")
         panel_tabla.pack(fill="both", expand=True)
-        
+
         self.tabla = ttk.Treeview(panel_tabla, show="headings")
         scroll_y = ttk.Scrollbar(panel_tabla, orient="vertical", command=self.tabla.yview)
         scroll_x = ttk.Scrollbar(panel_tabla, orient="horizontal", command=self.tabla.xview)
         self.tabla.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
-        
+
         scroll_y.pack(side="right", fill="y")
         scroll_x.pack(side="bottom", fill="x")
         self.tabla.pack(side="left", fill="both", expand=True)
@@ -721,7 +920,7 @@ class ServidorBigData(tk.Tk):
             cancelado = threading.Event()
             decision = threading.Lock()
             resultado = {}
-            # La decisión, su aplicación y la señal se realizan en el hilo Tk.
+
             def aceptar():
                 with decision:
                     anterior = self.df_recibido, self.df_actual, self.pagina_actual
@@ -740,6 +939,7 @@ class ServidorBigData(tk.Tk):
                         resultado.update(ok=False, filas=0, detalle=str(error))
                     finally:
                         aceptado.set()
+
             self.cola.put(aceptar)
             limite = time.monotonic() + TIEMPO_ESPERA
             while not aceptado.wait(PASO_ESPERA):
@@ -831,12 +1031,28 @@ class ServidorBigData(tk.Tk):
         self.df_recibido = df_nuevo
         self.df_actual = self.df_recibido
         self.pagina_actual = 0
-        
+
         self.cargar_datos_en_tabla()
-        
+
         self._mostrar_estado_datos(f"● Datos recibidos: {miles(len(self.df_recibido))} registros.", EXITO)
         self.btn_filtrar.configure(state="normal")
         self.btn_limpiar.configure(state="normal")
+
+        # Calcular estadísticas descriptivas del CSV en segundo plano
+        self.dashboard.mostrar_cargando()
+        threading.Thread(
+            target=self._calcular_dashboard, args=(df_nuevo,), daemon=True
+        ).start()
+
+    def _calcular_dashboard(self, df):
+        try:
+            resumen = DashboardEstadistico.calcular_resumen(df)
+            self.cola.put(lambda: None if self._cerrando else self.dashboard.actualizar_vista(resumen))
+        except Exception as error:
+            mensaje = str(error)
+            self.cola.put(lambda: None if self._cerrando else self.dashboard.lbl_resumen.configure(
+                text=f"● Error al calcular estadísticas: {mensaje}", fg=ERROR
+            ))
 
     # -----------------------------------------------------------------------
     # LÓGICA DE INTERFAZ, PAGINACIÓN Y FILTROS
@@ -859,21 +1075,18 @@ class ServidorBigData(tk.Tk):
             self.lbl_pagina.config(text="Sin resultados. · 0 registros")
             return
 
-        # Calcular Slices para Paginación
         inicio = self.pagina_actual * self.registros_por_pagina
         fin = inicio + self.registros_por_pagina
         df_pagina = self.df_actual.iloc[inicio:fin]
-        
-        # Inserción rápida convirtiendo a listas
+
         filas_valores = df_pagina.astype(object).where(df_pagina.notna(), "—").values.tolist()
         for fila in filas_valores:
             self.tabla.insert("", "end", values=fila)
-            
-        # Actualizar textos y botones
+
         total_paginas = max(1, (len(self.df_actual) - 1) // self.registros_por_pagina + 1)
         mostrando_fin = min(fin, len(self.df_actual))
         self.lbl_pagina.config(text=f"Página {self.pagina_actual + 1} de {total_paginas}  ·  Mostrando {miles(inicio + 1)} al {miles(mostrando_fin)}")
-        
+
         self.btn_anterior.config(state="normal" if self.pagina_actual > 0 else "disabled")
         self.btn_siguiente.config(state="normal" if fin < len(self.df_actual) else "disabled")
 
@@ -903,13 +1116,14 @@ class ServidorBigData(tk.Tk):
             return
         ascendente = not self._orden[1] if self._orden and self._orden[0] == columna else True
         original = self.df_actual
+
         def ordenar():
             try:
                 return original.sort_values(columna, ascending=ascendente, kind="stable", na_position="last")
             except TypeError:
-                # Una columna con tipos mezclados se compara como texto; los vacíos quedan al final.
                 return original.sort_values(columna, ascending=ascendente, kind="stable",
                                             na_position="last", key=lambda serie: serie.astype("string"))
+
         sentido = "ascendente" if ascendente else "descendente"
         self._calcular_vista(ordenar, "Ordenando datos...",
                              f"Orden {sentido}: {columna}.", (columna, ascendente))
@@ -922,9 +1136,11 @@ class ServidorBigData(tk.Tk):
         version = self._version_filtro
         self._mostrar_estado_datos(mensaje, AVISO)
         self.btn_filtrar.configure(state="disabled")
+
         def trabajo():
             try:
                 nuevo = calcular()
+
                 def aplicar():
                     if version != self._version_filtro:
                         return
@@ -933,14 +1149,17 @@ class ServidorBigData(tk.Tk):
                     self.pagina_actual = 0
                     self.cargar_datos_en_tabla()
                     self._mostrar_estado_datos(resultado.replace("{filas}", miles(len(nuevo))), EXITO)
+
                 self.cola.put(aplicar)
             except Exception as error:
                 def fallar(texto=str(error)):
                     if version == self._version_filtro:
                         self._mostrar_estado_datos(f"Error al actualizar la vista: {texto}", ERROR)
+
                 self.cola.put(fallar)
             finally:
                 self.cola.put(lambda: self.btn_filtrar.configure(state="normal"))
+
         self._hilo_filtro = threading.Thread(target=trabajo, daemon=True)
         self._hilo_filtro.start()
 
@@ -957,7 +1176,6 @@ class ServidorBigData(tk.Tk):
 
     def _revisar_cola(self):
         try:
-            # Un lote acotado evita monopolizar el bucle de eventos.
             for _ in range(50):
                 try:
                     tarea = self.cola.get_nowait()
@@ -982,7 +1200,6 @@ class ServidorBigData(tk.Tk):
         self._esperar_cierre()
 
     def _esperar_cierre(self):
-        # No bloquear Tk mientras los trabajadores observan la cancelación.
         hilos = (
             self._hilo_escucha,
             self._hilo_escucha_sensores,
@@ -1004,6 +1221,7 @@ class ServidorBigData(tk.Tk):
 
 class ServidorPrueba(ServidorBigData):
     """Adaptador de los nombres históricos usados por las pruebas de Grupo 3."""
+
     def __init__(self):
         super().__init__()
         self.boton = self.boton_red
@@ -1014,8 +1232,6 @@ class ServidorPrueba(ServidorBigData):
         self.alternar_servidor()
 
     def _atender_cliente(self, conexion):
-        # La API histórica es síncrona para el emisor: no requiere bombear Tk
-        # mientras se espera el ACK. El dashboard oficial no utiliza este camino.
         try:
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
             df = dataframe_validado(registros)
