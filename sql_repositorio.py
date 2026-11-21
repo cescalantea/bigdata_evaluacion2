@@ -1,4 +1,26 @@
-﻿"""Persistencia CAMELS normalizada; transacciones independientes de MongoDB."""
+"""
+Módulo de persistencia relacional para almacenar los datos CAMELS recibidos
+por el servidor Big Data en PostgreSQL alojado en Neon.
+Autor: Grupo 4.
+Licencia: solo educacional.
+Fecha creación: 21-11-2026.
+Fecha modificación: 21-11-2026.
+Modificaciones: incorporación de SQLRepositorio con conexión segura mediante
+SSL, configuración por variables de entorno, validación del DataFrame,
+carga masiva mediante COPY y control de transacciones y duplicados.
+
+PERSISTENCIA POSTGRESQL NEON (Grupo 4) - Repositorio de Datos CAMELS.
+
+Reutiliza el DataFrame recibido por el servidor TCP y separa sus registros
+en estaciones y mediciones de caudal para almacenarlos en las tablas
+relacionales existentes, conservando la persistencia en MongoDB Atlas.
+Valida columnas, fechas, tipos, precisión numérica y consistencia de los
+datos antes de escribir. Inserta primero las estaciones y después las
+mediciones dentro de una transacción, utilizando ON CONFLICT para evitar
+duplicados idénticos y rollback ante errores previos a la confirmación.
+Si DATABASE_URL no está configurada, la persistencia SQL queda deshabilitada.
+"""
+
 import logging
 import os
 import threading
