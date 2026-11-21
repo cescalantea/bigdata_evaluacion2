@@ -27,6 +27,7 @@ import uuid
 import tkinter as tk
 from tkinter import ttk
 import pandas as pd
+from sql_repositorio import SQLRepositorio
 
 try:
     from dotenv import load_dotenv
@@ -677,6 +678,7 @@ class ServidorBigData(tk.Tk):
         self._hilo_filtro = None
         self._version_filtro = 0
         self.mongo = MongoRepositorio()
+        self.sql = SQLRepositorio()
         self._ultima_persistencia = None
         self._sensores_recibidos = 0
         self._sensores_lock = threading.Lock()
@@ -918,6 +920,20 @@ class ServidorBigData(tk.Tk):
             if todas_finalizadas:
                 self.cola.put(self._al_detenerse)
 
+    def _persistir_dataframe(self, dataframe):
+        resultados = {}
+        for nombre, repositorio in (("MongoDB", self.mongo), ("PostgreSQL", self.sql)):
+            try:
+                info = repositorio.guardar_dataframe(dataframe)
+                info.setdefault("estado", "guardado" if info["habilitado"] else "deshabilitado")
+            except Exception:
+                # No propagar mensajes del driver: pueden contener secretos.
+                info = dict(estado="fallido", insertados=0,
+                            detalle="Escritura no confirmada; puede requerir revision de carga parcial.")
+            resultados[nombre] = info
+            logging.info("Persistencia %s: %s", nombre, info)
+        return resultados
+
     def _atender_cliente(self, conexion):
         try:
             # El puerto CSV conserva el contrato de Evaluacion 2.
@@ -926,7 +942,7 @@ class ServidorBigData(tk.Tk):
             del registros
             # La insercion ocurre fuera del hilo de Tkinter para no congelar la GUI.
             # Sin MONGODB_URI configurada, este paso no modifica la demo local.
-            persistencia = self.mongo.guardar_dataframe(df_nuevo)
+            persistencia = self._persistir_dataframe(df_nuevo)
             self._ultima_persistencia = persistencia
             aceptado = threading.Event()
             cancelado = threading.Event()
@@ -940,21 +956,21 @@ class ServidorBigData(tk.Tk):
                         if cancelado.is_set() or self.detener_escucha.is_set() or self._cerrando:
                             raise ValueError("Transferencia cancelada: servidor detenido o aceptación vencida.")
                         self._datos_recibidos(df_nuevo)
-                        if persistencia["habilitado"]:
-                            self._mostrar_estado_datos(
-                                f"● Datos recibidos: {miles(len(self.df_recibido))} registros. "
-                                f"MongoDB: {miles(persistencia['insertados'])} guardados.", EXITO)
-                            self._mostrar_estado(
-                                "● Recepción completada. Servidor a la escucha.", EXITO)
+                        resumen = "; ".join(
+                            f"{base}: {info['estado']} ({info.get('insertados', 0)} insertados)"
+                            + (f"; {info['detalle']}" if info.get('detalle') else "")
+                            for base, info in persistencia.items())
+                        fallo = any(r['estado'] == 'fallido' for r in persistencia.values())
+                        self._mostrar_estado_datos(
+                            f"Datos recibidos: {miles(len(df_nuevo))}. {resumen}",
+                            AVISO if fallo else EXITO)
+                        self._mostrar_estado("Recepcion completada. " + resumen,
+                                             AVISO if fallo else EXITO)
+                        if fallo:
+                            resultado.update(ok=False, filas=len(df_nuevo), detalle=resumen,
+                                             persistencia=persistencia)
                         else:
-                            self._mostrar_estado_datos(
-                                f"● Datos recibidos: {miles(len(self.df_recibido))} registros. "
-                                "MongoDB no configurado; no se guardaron.", AVISO)
-                            self._mostrar_estado(
-                                "● CSV recibido solo en memoria; configure MongoDB para guardarlo.",
-                                AVISO,
-                            )
-                        resultado.update(ok=True, filas=len(df_nuevo))
+                            resultado.update(ok=True, filas=len(df_nuevo))
                     except Exception as error:
                         self.df_recibido, self.df_actual, self.pagina_actual = anterior
                         resultado.update(ok=False, filas=0, detalle=str(error))
@@ -1233,6 +1249,7 @@ class ServidorBigData(tk.Tk):
             while not self.cola.empty():
                 self.cola.get_nowait()
             self.mongo.cerrar()
+            self.sql.cerrar()
             self.destroy()
 
 
