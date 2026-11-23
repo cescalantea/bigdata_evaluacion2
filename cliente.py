@@ -820,6 +820,17 @@ class VentanaCliente(tk.Tk):
         self.etiqueta_traza = ttk.Label(traza, text=TEXTO_SIN_TRANSMISION, style="Suave.TLabel",
                                         wraplength=900, justify="left")
         self.etiqueta_traza.pack(anchor="w", pady=(4, 0))
+        exportar = ttk.Frame(traza, style="Tarjeta.TFrame")
+        exportar.pack(fill="x", pady=(8, 0))
+        ttk.Label(exportar, text="Exportar lo capturado", style="Suave.TLabel").pack(side="left")
+        self.boton_csv = ttk.Button(exportar, text="CSV…", command=lambda: self.exportar_captura("csv"),
+                                    state="disabled")
+        self.boton_csv.pack(side="left", padx=(8, 4))
+        self.boton_json = ttk.Button(exportar, text="JSON…", command=lambda: self.exportar_captura("json"),
+                                     state="disabled")
+        self.boton_json.pack(side="left")
+        self.etiqueta_exportado = ttk.Label(exportar, text="", style="Suave.TLabel")
+        self.etiqueta_exportado.pack(side="left", padx=10)
         self.buscar_puertos()
 
     # Propósito: datos de red y avance del envío de la pestaña Arduino.
@@ -853,11 +864,13 @@ class VentanaCliente(tk.Tk):
         except sensor_arduino.ErrorSensor as error:
             self.etiqueta_arduino.configure(text=f"✖ {error}", foreground=ERROR)
             return
-        self.combo_puerto.configure(values=puertos)
-        if puertos and self.combo_puerto.get() not in puertos:
-            self.combo_puerto.set(puertos[0])
+        # El simulador (simulador_arduino.py) aparece siempre al final, como un puerto más.
+        opciones = puertos + [sensor_arduino.URL_SIMULADOR]
+        self.combo_puerto.configure(values=opciones, width=26)
+        if self.combo_puerto.get() not in opciones:
+            self.combo_puerto.set(opciones[0])
         self.etiqueta_arduino.configure(
-            text="" if puertos else "No se detectó ningún Arduino.", foreground=SUAVE)
+            text="" if puertos else "Sin Arduino físico: puede usar el simulador.", foreground=SUAVE)
 
     def alternar_arduino(self):
         if self.lector is None:
@@ -894,6 +907,7 @@ class VentanaCliente(tk.Tk):
             self.grabadora.cerrar()
             self._mostrar_traza("Interrumpida (no se envió)")
         self.grabando = False
+        self._actualizar_exportar()
         self.boton_iniciar.configure(state="normal" if self.emisor is None else "disabled")
         self.boton_detener.configure(state="disabled")
         self.combo_tasa.configure(state="readonly")
@@ -934,11 +948,41 @@ class VentanaCliente(tk.Tk):
             return
         self.grabadora = sensor_arduino.Grabadora()
         self.grabando = True
+        self.etiqueta_exportado.configure(text="")
+        self._actualizar_exportar()
         self.boton_iniciar.configure(state="disabled")
         self.boton_detener.configure(state="normal")
         self.combo_tasa.configure(state="disabled")
         self._bloquear(False)             # mientras se graba, el envío del CSV queda deshabilitado
         self._tomar_muestra()
+
+    # Propósito: habilitar los botones de exportar solo si hay una transmisión terminada con filas.
+    def _actualizar_exportar(self):
+        hay = self.grabadora is not None and not self.grabando and bool(self.grabadora.registros)
+        for boton in (self.boton_csv, self.boton_json):
+            boton.configure(state="normal" if hay else "disabled")
+
+    # Propósito: guardar en CSV o JSON las filas de la última transmisión (las mismas que se envían
+    # al servidor). 'ruta' se pasa solo en las pruebas; si falta, se pregunta con el diálogo de guardar.
+    def exportar_captura(self, formato, ruta=None):
+        if self.grabadora is None or self.grabando or not self.grabadora.registros:
+            return
+        if ruta is None:
+            ruta = filedialog.asksaveasfilename(
+                title=f"Exportar {formato.upper()}", defaultextension=f".{formato}",
+                initialfile=f"transmision_{self.grabadora.inicio:%Y%m%d_%H%M%S}.{formato}",
+                filetypes=[(formato.upper(), f"*.{formato}"), ("Todos", "*.*")])
+            if not ruta:
+                return
+        try:
+            guardar = sensor_arduino.exportar_csv if formato == "csv" else sensor_arduino.exportar_json
+            guardar(ruta, self.grabadora.registros)
+        except OSError as error:
+            self.etiqueta_exportado.configure(text=f"✖ No se pudo guardar: {error}", foreground=ERROR)
+            return
+        self.etiqueta_exportado.configure(
+            text=f"✔ {miles(len(self.grabadora.registros))} filas guardadas ({formato.upper()})",
+            foreground=EXITO)
 
     # Propósito: escribir el panel de trazabilidad con el inicio, el cierre (o "en curso"), la duración,
     # las filas y la frecuencia elegida. 'estado' es el texto de cierre cuando ya terminó o se interrumpió.
@@ -977,6 +1021,7 @@ class VentanaCliente(tk.Tk):
         self.combo_tasa.configure(state="readonly")
         self.grabadora.cerrar()           # momento exacto en que el usuario detuvo la transmisión
         registros = self.grabadora.registros
+        self._actualizar_exportar()
         self._mostrar_traza("Cierre")
         if not registros:
             self.boton_iniciar.configure(state="normal")

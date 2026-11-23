@@ -1,5 +1,7 @@
 """Pruebas del sensor Arduino (sin hardware: puerto serie falso). Ejecutar:  python -m pytest -q"""
 
+import csv
+import json
 import socket
 import threading
 import time
@@ -144,7 +146,7 @@ def ventana():
     v.destroy()
 
 
-def test_rec_stop_envia_las_filas_al_servidor(ventana):
+def test_rec_stop_envia_las_filas_al_servidor(ventana, tmp_path):
     escucha = socket.create_server(("127.0.0.1", 0))
     resultado = {}
 
@@ -177,6 +179,16 @@ def test_rec_stop_envia_las_filas_al_servidor(ventana):
     traza = v.etiqueta_traza.cget("text")             # trazabilidad: inicio y cierre quedan a la vista
     assert "Inicio: " in traza and "Cierre: " in traza and "en curso" not in traza
     assert "3 filas" in traza and "1 dato por segundo" in traza
+    # Exportar: el JSON es idéntico a lo que recibió el servidor; el CSV trae las mismas filas.
+    assert str(v.boton_csv.cget("state")) == "normal" and str(v.boton_json.cget("state")) == "normal"
+    v.exportar_captura("json", tmp_path / "t.json")
+    v.exportar_captura("csv", tmp_path / "t.csv")
+    assert json.loads((tmp_path / "t.json").read_text(encoding="utf-8")) == resultado["registros"]
+    with open(tmp_path / "t.csv", encoding="utf-8", newline="") as archivo:
+        filas = list(csv.DictReader(archivo))
+    assert list(filas[0]) == ["fecha_hora", "temperatura", "humedad", "gas"]
+    assert [f["gas"] for f in filas] == [str(r["gas"]) for r in resultado["registros"]]
+    assert "3 filas guardadas" in v.etiqueta_exportado.cget("text")
 
 
 def test_stop_sin_filas_no_envia(ventana):
@@ -203,3 +215,26 @@ def test_desconectar_en_plena_transmision_deja_la_traza_interrumpida(ventana):
     v.desconectar_arduino("Sin conexión")
     traza = v.etiqueta_traza.cget("text")
     assert "Interrumpida (no se envió)" in traza and not v.grabando
+
+
+def test_exportar_deshabilitado_sin_transmision_y_durante_ella(ventana, tmp_path):
+    v = ventana
+    assert str(v.boton_csv.cget("state")) == "disabled"      # aún no hay nada que exportar
+    v.exportar_captura("csv", tmp_path / "x.csv")             # no hace nada
+    assert not (tmp_path / "x.csv").exists()
+    v.lector = LectorFalso()
+    v.iniciar_grabacion()
+    assert str(v.boton_json.cget("state")) == "disabled"     # mientras se transmite
+    v.desconectar_arduino()                                   # corte: lo capturado queda exportable
+    assert str(v.boton_json.cget("state")) == "normal"
+    v.exportar_captura("json", tmp_path / "x.json")
+    assert len(json.loads((tmp_path / "x.json").read_text(encoding="utf-8"))) == 1
+
+
+def test_exportaciones_tienen_solo_las_cuatro_columnas_enviadas(tmp_path):
+    filas = [{"fecha_hora": "2026-11-23 15:00:00.123", "temperatura": 23.0, "humedad": 55.0, "gas": 134.0}]
+    sensor_arduino.exportar_csv(tmp_path / "a.csv", filas)
+    sensor_arduino.exportar_json(tmp_path / "a.json", filas)
+    assert (tmp_path / "a.csv").read_text(encoding="utf-8").splitlines() == [
+        "fecha_hora,temperatura,humedad,gas", "2026-11-23 15:00:00.123,23.0,55.0,134.0"]
+    assert json.loads((tmp_path / "a.json").read_text(encoding="utf-8")) == filas

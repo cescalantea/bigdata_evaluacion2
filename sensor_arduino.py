@@ -7,12 +7,18 @@ El Arduino manda líneas "temperatura,humedad,gas" (ver scrip_arduino_sensor_v1.
 Requisitos: pip install pyserial
 """
 
+import csv
+import json
 import math
+import os
 import threading
 import time
 from datetime import datetime
 
 BAUDIOS = 9600                 # debe coincidir con Serial.begin() del Arduino
+# Simulador (simulador_arduino.py): pyserial abre "socket://..." igual que un COM, sin drivers.
+PUERTO_SIMULADOR = int(os.environ.get("SIMULADOR_PUERTO", "5577"))
+URL_SIMULADOR = f"socket://127.0.0.1:{PUERTO_SIMULADOR}"
 MAX_EDAD_LECTURA = 6.0         # s: una lectura más vieja no se graba (sensor caído o desconectado)
 
 # Tres alternativas de captura: nombre en pantalla -> segundos entre muestras.
@@ -54,16 +60,18 @@ def listar_puertos():
     return sorted(p.device for p in list_ports.comports())
 
 
-# Propósito: abrir el puerto serie. timeout corto para poder revisar la orden de parar.
+# Propósito: abrir el puerto serie (COM3, /dev/ttyACM0) o la URL del simulador (socket://...).
+# timeout corto para poder revisar la orden de parar.
 def abrir_serial(puerto, baudios=BAUDIOS):
     try:
         import serial
     except ImportError as error:
         raise ErrorSensor("Falta pyserial: ejecute  pip install pyserial") from error
     try:
-        return serial.Serial(puerto, baudios, timeout=0.5)
+        return serial.serial_for_url(puerto, baudrate=baudios, timeout=0.5)
     except (serial.SerialException, ValueError, OSError) as error:
-        raise ErrorSensor(f"No se pudo abrir {puerto}: {error}") from error
+        pista = " ¿Está encendido el simulador?" if puerto.startswith("socket://") else ""
+        raise ErrorSensor(f"No se pudo abrir {puerto}: {error}.{pista}") from error
 
 
 class LectorSerial:
@@ -108,19 +116,42 @@ class LectorSerial:
         return lectura if time.monotonic() - instante <= MAX_EDAD_LECTURA else None
 
     # Propósito: (hilo) leer líneas hasta que se pida parar o falle el cable.
+    # readline() devuelve lo que alcanzó a llegar si vence el timeout a mitad de línea:
+    # se acumula en 'pendiente' hasta ver el salto de línea, para no perder esa lectura.
     def _bucle(self):
+        pendiente = b""
         while not self._parar.is_set():
             try:
-                linea = self._serie.readline().decode("ascii", errors="ignore")
+                pendiente += self._serie.readline()
             except Exception as error:   # cable desconectado: SerialException u OSError
                 if not self._parar.is_set():
                     self._al_error(f"Se perdió la conexión con {self.puerto}: {error}")
                 return
-            lectura = parsear_linea(linea) if linea else None
+            if not pendiente.endswith(b"\n"):
+                if len(pendiente) > 256:  # basura sin salto de línea: no crecer sin límite
+                    pendiente = b""
+                continue
+            linea, pendiente = pendiente.decode("ascii", errors="ignore"), b""
+            lectura = parsear_linea(linea)
             if lectura is not None:
                 with self._candado:
                     self._ultima = (lectura, time.monotonic())
                 self._al_lectura(lectura)
+
+
+# Propósito: guardar las filas capturadas como CSV. Las columnas son exactamente las que se envían
+# al servidor: fecha_hora, temperatura, humedad, gas.
+def exportar_csv(ruta, registros):
+    with open(ruta, "w", encoding="utf-8", newline="") as archivo:
+        escritor = csv.DictWriter(archivo, fieldnames=("fecha_hora",) + CAMPOS)
+        escritor.writeheader()
+        escritor.writerows(registros)
+
+
+# Propósito: guardar las filas capturadas como JSON: una lista de objetos, igual que viaja por el socket.
+def exportar_json(ruta, registros):
+    with open(ruta, "w", encoding="utf-8") as archivo:
+        json.dump(registros, archivo, ensure_ascii=False, indent=2, allow_nan=False)
 
 
 class Grabadora:

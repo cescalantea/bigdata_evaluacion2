@@ -159,6 +159,24 @@ flowchart TD
 Además, **cada fila** lleva su propia `fecha_hora` (con milisegundos), así que el servidor
 recibe la trazabilidad fila por fila y no solo el inicio y el cierre.
 
+## 5.2 Exportar lo capturado (CSV y JSON)
+
+En el panel de trazabilidad, los botones **CSV…** y **JSON…** guardan las filas de la última
+transmisión, es decir, las mismas que se envían al servidor. Se habilitan al detener la
+transmisión (o si se cortó el cable) y se deshabilitan mientras se transmite.
+
+Ambos formatos llevan **solo cuatro campos**: `fecha_hora`, `temperatura`, `humedad`, `gas`.
+
+```text
+CSV                                          JSON (igual que viaja por el socket)
+fecha_hora,temperatura,humedad,gas           [ { "fecha_hora": "2026-11-23 15:00:00.123",
+2026-11-23 15:00:00.123,23.0,55.0,134.0        "temperatura": 23.0, "humedad": 55.0, "gas": 134.0 } ]
+```
+
+El JSON exportado es idéntico a lo que recibe el servidor (hay una prueba que lo comprueba).
+Sirve para comparar cómo cambia el tipo de dato: en CSV todo es texto y el lector decide el
+tipo; en JSON los números llegan ya como números.
+
 ## 6. Protocolo hacia el servidor (sin cambios)
 
 El servidor es del Grupo 4 y no se modificó. La transmisión Arduino reutiliza el mismo
