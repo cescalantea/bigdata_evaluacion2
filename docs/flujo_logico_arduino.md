@@ -15,12 +15,12 @@ Hay **dos conexiones distintas** y no deben confundirse:
 
 ```mermaid
 flowchart TD
-    A["Arduino Uno<br/>DHT11 + MQ-2"] -->|"línea CSV por USB<br/>cada 200 ms"| B["LectorSerial<br/>hilo lector"]
+    A["Arduino Uno<br/>DHT11 + MQ-2"] -->|"línea CSV por USB<br/>cada 1 s"| B["LectorSerial<br/>hilo lector"]
     B -->|"parsear_linea valida rango"| C{"¿Línea válida?"}
     C -->|No| D["Se descarta<br/>ERROR_LECTURA, ruido"]
     C -->|Sí| E["Última lectura<br/>vigente 6 s"]
     E -->|"cola de tareas"| F["GUI: 3 gráficos de línea<br/>temperatura, humedad, gas"]
-    E -->|"cada 1 s, 0,5 s o 0,2 s"| G["Grabadora<br/>filas en memoria"]
+    E -->|"cada 1, 2 o 3 s"| G["Grabadora<br/>filas en memoria"]
     G -->|"Detener transmisión"| H["EmisorTCP<br/>JSON por lotes + EOF"]
     I["Pestaña CSV<br/>Dataset + selección de columnas"] -->|"Enviar datos"| H
     H -->|"TCP"| J["Servidor<br/>valida, muestra y responde ACK"]
@@ -59,7 +59,7 @@ sequenceDiagram
 
     U->>G: Conectar Arduino
     G->>L: iniciar() abre el puerto
-    loop cada 200 ms
+    loop cada 1 s
         L->>L: readline() + parsear_linea()
         L->>G: lectura válida (por la cola)
         G->>G: actualiza los 3 gráficos
@@ -112,14 +112,15 @@ Qué ocurre en cada estado:
   Mientras tanto, el envío del CSV queda deshabilitado para no mezclar ambos flujos.
 - **Enviando:** hilo aparte; la ventana sigue respondiendo y se puede **cancelar**.
 
-## 5. Las tres tasas de captura
+## 5. Las tres frecuencias de captura
 
-La tasa decide **cuándo se guarda una fila**, no cuándo llega un dato. El Arduino envía
-siempre a 5 líneas/s y la aplicación toma la última lectura vigente en cada tic.
+El **DHT11 entrega un dato nuevo por segundo como máximo (1 Hz)**. Por eso la frecuencia más
+rápida posible es 1 dato por segundo, y las otras dos son más lentas. El Arduino (script v3)
+envía una línea por segundo, y la aplicación decide cada cuánto **guarda** una fila.
 
 ```mermaid
 flowchart TD
-    T["Tic del temporizador<br/>1 s, 0,5 s o 0,2 s"] --> Q{"¿Hay lectura<br/>de hace menos de 6 s?"}
+    T["Tic del temporizador<br/>1 s, 2 s o 3 s"] --> Q{"¿Hay lectura<br/>de hace menos de 6 s?"}
     Q -->|Sí| W["Guarda la fila<br/>fecha_hora + 3 valores"]
     Q -->|No| X["Omite el tic<br/>sensor caído o sin datos"]
     W --> N["Programa el siguiente tic"]
@@ -128,13 +129,35 @@ flowchart TD
 
 | Opción | Intervalo | Filas por minuto |
 |---|---|---|
-| 1 dato por segundo | 1,0 s | 60 |
-| 2 datos por segundo | 0,5 s | 120 |
-| 5 datos por segundo | 0,2 s | 300 |
+| 1 dato por segundo | 1 s | 60 |
+| 1 dato cada 2 segundos | 2 s | 30 |
+| 1 dato cada 3 segundos | 3 s | 20 |
 
-> **Límite físico:** el DHT11 no mide más de ~1 vez por segundo. En el script v2 se lee a
-> 1 Hz y se repite el último valor entre lecturas. Con 2 y 5 datos por segundo,
-> temperatura y humedad se repetirán; el **gas** sí cambia en cada fila.
+> **Historial:** las versiones anteriores ofrecían 2 y 5 datos por segundo, que el DHT11
+> no puede entregar: se repetían valores. Se retiraron y el script v3 envía a 1 Hz.
+
+## 5.1 Trazabilidad de la transmisión
+
+Al pulsar **Iniciar transmisión** la `Grabadora` registra la fecha y hora de inicio, y al
+pulsar **Detener transmisión** (o al cortarse el cable) registra el cierre. El panel
+"Trazabilidad de la transmisión" de la pestaña Arduino lo muestra:
+
+```text
+Inicio: 23/11/2026 15:28:35   ·   Cierre: 23/11/2026 15:31:02
+Duración: 2 min 27 s   ·   147 filas   ·   Frecuencia: 1 dato por segundo
+```
+
+```mermaid
+flowchart TD
+    A["Iniciar transmisión"] --> B["Se registra el inicio"]
+    B --> C["Panel: Cierre en curso,<br/>se actualiza en cada tic"]
+    C --> D{"¿Cómo termina?"}
+    D -->|"Detener transmisión"| E["Se registra el cierre<br/>y se envía al servidor"]
+    D -->|"Se corta el cable"| F["Se registra el cierre<br/>como Interrumpida: no se envía"]
+```
+
+Además, **cada fila** lleva su propia `fecha_hora` (con milisegundos), así que el servidor
+recibe la trazabilidad fila por fila y no solo el inicio y el cierre.
 
 ## 6. Protocolo hacia el servidor (sin cambios)
 
@@ -212,8 +235,8 @@ flowchart TD
 |---|---|
 | `sensor_arduino.py` | Lógica del sensor sin GUI: parseo, lector serie, grabadora, tasas |
 | `cliente.py` | Ventana con pestañas, gráficos (`GraficoLinea`) y `EmisorTCP` |
-| `scrip_arduino_sensor_v2.txt` | Código para el Arduino: envía cada 200 ms |
-| `tests/test_sensor.py` | 20 pruebas con un puerto serie simulado, sin hardware |
+| `scrip_arduino_sensor_v3.txt` | Código para el Arduino: 1 línea por segundo (límite del DHT11) |
+| `tests/test_sensor.py` | 22 pruebas con un puerto serie simulado, sin hardware |
 
 Seguridad aplicada: validación de rango de todo lo que llega por el cable, límite de
 antigüedad de lectura, y sin secretos ni datos sensibles en pantalla ni logs.

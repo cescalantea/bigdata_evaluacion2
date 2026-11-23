@@ -10,6 +10,8 @@ import pytest
 import sensor_arduino
 import servidor_prueba
 from cliente import VentanaCliente
+from datetime import datetime, timedelta
+
 from sensor_arduino import Grabadora, LectorSerial, parsear_linea
 
 
@@ -103,8 +105,20 @@ def test_grabadora_guarda_filas_y_omite_si_no_hay_lectura():
     assert len(g.registros) == 1
 
 
-def test_las_tres_tasas_pedidas():
-    assert sorted(sensor_arduino.TASAS.values()) == [0.2, 0.5, 1.0]
+def test_las_tres_tasas_respetan_el_limite_del_dht11():
+    # El DHT11 entrega 1 dato por segundo: ninguna tasa puede ser más rápida que eso.
+    assert sorted(sensor_arduino.TASAS.values()) == [1.0, 2.0, 3.0]
+
+
+def test_grabadora_registra_inicio_cierre_y_duracion():
+    inicio = datetime(2026, 11, 23, 14, 5, 12)
+    g = Grabadora(ahora=inicio)
+    assert g.inicio == inicio and g.cierre is None
+    assert g.duracion(ahora=inicio + timedelta(seconds=5)) == 5.0   # en curso: mide hasta "ahora"
+    g.cerrar(ahora=inicio + timedelta(seconds=90))
+    g.cerrar(ahora=inicio + timedelta(seconds=999))                 # un segundo cierre no cambia nada
+    assert g.cierre == inicio + timedelta(seconds=90)
+    assert g.duracion() == 90.0
 
 
 # --- Ventana: Iniciar -> Detener transmisión -> servidor ---------------------------------------------------
@@ -160,6 +174,9 @@ def test_rec_stop_envia_las_filas_al_servidor(ventana):
     assert set(resultado["registros"][0]) == {"fecha_hora", "temperatura", "humedad", "gas"}
     assert "confirmó" in v.etiqueta_envio.cget("text")
     assert not v.grabando
+    traza = v.etiqueta_traza.cget("text")             # trazabilidad: inicio y cierre quedan a la vista
+    assert "Inicio: " in traza and "Cierre: " in traza and "en curso" not in traza
+    assert "3 filas" in traza and "1 dato por segundo" in traza
 
 
 def test_stop_sin_filas_no_envia(ventana):
@@ -176,3 +193,13 @@ def test_rec_exige_ip_y_puerto_validos(ventana):
     v.var_puerto.set("abc")
     v.iniciar_grabacion()
     assert not v.grabando
+
+
+def test_desconectar_en_plena_transmision_deja_la_traza_interrumpida(ventana):
+    v = ventana
+    v.lector = LectorFalso()
+    v.iniciar_grabacion()
+    assert "en curso" in v.etiqueta_traza.cget("text")
+    v.desconectar_arduino("Sin conexión")
+    traza = v.etiqueta_traza.cget("text")
+    assert "Interrumpida (no se envió)" in traza and not v.grabando

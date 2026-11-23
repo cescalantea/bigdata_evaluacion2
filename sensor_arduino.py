@@ -16,8 +16,8 @@ BAUDIOS = 9600                 # debe coincidir con Serial.begin() del Arduino
 MAX_EDAD_LECTURA = 6.0         # s: una lectura más vieja no se graba (sensor caído o desconectado)
 
 # Tres alternativas de captura: nombre en pantalla -> segundos entre muestras.
-# El Arduino debe enviar al menos a 5 líneas/s (ver scrip_arduino_sensor_v2.txt).
-TASAS = {"1 dato por segundo": 1.0, "2 datos por segundo": 0.5, "5 datos por segundo": 0.2}
+# El DHT11 entrega 1 dato por segundo como máximo (1 Hz), así que 1 s es la tasa más rápida posible.
+TASAS = {"1 dato por segundo": 1.0, "1 dato cada 2 segundos": 2.0, "1 dato cada 3 segundos": 3.0}
 
 # Rangos admitidos: lo que llega por serie no es de confianza (ruido, línea corrupta).
 RANGOS = {"temperatura": (-40.0, 80.0), "humedad": (0.0, 100.0), "gas": (0.0, 1023.0)}
@@ -127,10 +127,23 @@ class Grabadora:
     """
     Acumula filas (fecha_hora, temperatura, humedad, gas) mientras está grabando.
     El reloj de muestreo lo pone la GUI (after); aquí solo se decide qué fila guardar.
+    Guarda además la fecha y hora de inicio y de cierre, para la trazabilidad de la transmisión.
     """
 
-    def __init__(self):
+    def __init__(self, ahora=None):
         self.registros = []
+        self.inicio = ahora or datetime.now()     # momento en que se pulsó "Iniciar transmisión"
+        self.cierre = None                        # None mientras la transmisión sigue en curso
+
+    # Propósito: marcar el cierre de la transmisión. Solo cuenta la primera llamada.
+    def cerrar(self, ahora=None):
+        if self.cierre is None:
+            self.cierre = ahora or datetime.now()
+        return self.cierre
+
+    # Propósito: duración en segundos (hasta ahora si todavía no se cerró).
+    def duracion(self, ahora=None):
+        return ((self.cierre or ahora or datetime.now()) - self.inicio).total_seconds()
 
     # Propósito: guardar una fila con la lectura dada. Devuelve False si no hay lectura vigente.
     def muestrear(self, lectura, ahora=None):

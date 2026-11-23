@@ -54,6 +54,7 @@ COLUMNAS_POR_FILA = 3   # casillas por fila en la pantalla
 TIEMPO_CONEXION = 3     # segundos para conectar
 TIEMPO_RESPUESTA = 60   # segundos máximos sin avance (enviando o esperando la respuesta)
 PASO_ESPERA = 0.2       # segundos por espera; entre pasos se revisa si el usuario canceló
+TEXTO_SIN_TRANSMISION = "Aún no hay transmisiones. Al iniciar se registrará la fecha y hora de inicio y de cierre."
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +88,18 @@ def formatear_duracion(segundos):
         return f"{segundos:.1f} s".replace(".", ",")
     minutos, resto = divmod(round(segundos), 60)
     return f"{minutos} min {resto:02d} s"
+
+
+# Propósito: fecha y hora para la trazabilidad, en formato chileno: 23/11/2026 14:05:12.
+def formatear_fecha(momento):
+    return momento.strftime("%d/%m/%Y %H:%M:%S")
+
+
+# Propósito: mezclar un color "#RRGGBB" con blanco (factor 0 = igual, 1 = blanco).
+# Tkinter no tiene transparencia, así que el relleno bajo la línea es un tono claro ya mezclado.
+def aclarar(color, factor):
+    canales = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(c + (255 - c) * factor):02X}" for c in canales)
 
 
 # ---------------------------------------------------------------------------
@@ -323,22 +336,38 @@ class GraficoLinea(tk.Canvas):
         self.puntos.clear()
         self._dibujar()
 
-    # Propósito: título + valor actual arriba, y debajo la línea con escala automática.
+    # Propósito: número con coma decimal y los decimales propios de esta magnitud.
+    def _formato(self, valor):
+        return f"{valor:.{self.decimales}f}".replace(".", ",")
+
+    # Propósito: encabezado (nombre, mín/máx, valor actual) y debajo la línea con relleno suave,
+    # guías horizontales con su escala y un punto resaltado en el último dato.
     def _dibujar(self):
         self.delete("all")
         ancho, alto = self.winfo_width(), self.winfo_height()
-        self.create_text(10, 10, anchor="w", text=self.titulo, fill=SUAVE, font=(FUENTE, 9))
-        if not self.puntos or ancho < 80:
+        self.create_text(14, 14, anchor="w", text=self.titulo, fill=TEXTO, font=(FUENTE, 10, "bold"))
+        if not self.puntos or ancho < 120:
+            self.create_text(ancho / 2, alto / 2 + 8, text="Esperando datos…", fill=SUAVE,
+                             font=(FUENTE, 9))
             return
         actual = self.puntos[-1]
-        self.create_text(ancho - 10, 10, anchor="e", fill=TEXTO, font=(FUENTE, 11, "bold"),
-                         text=f"{actual:.{self.decimales}f} {self.unidad}".replace(".", ","))
-        izq, der, arriba, abajo = 10, ancho - 12, 26, alto - 10
+        texto = f"{self._formato(actual)} {self.unidad}".strip()
+        self.create_text(ancho - 14, 15, anchor="e", fill=TEXTO, font=(FUENTE, 16, "bold"), text=texto)
+        self.create_text(14, 31, anchor="w", fill=SUAVE, font=(FUENTE, 8),
+                         text=f"mín {self._formato(min(self.puntos))} · máx {self._formato(max(self.puntos))}")
+
+        izq, der, arriba, abajo = 46, ancho - 16, 52, alto - 16
         bajo, alto_val = min(self.puntos), max(self.puntos)
         centro = (bajo + alto_val) / 2
         mitad = max(alto_val - bajo, self.span_minimo) / 2
         bajo, alto_val = centro - mitad, centro + mitad
-        self.create_line(izq, abajo, der, abajo, fill="#E3E8ED")      # base, muy discreta
+        # Guías: tres niveles con su valor a la izquierda (sin cuadrícula pesada).
+        for fraccion in (0, 0.5, 1):
+            y = abajo - fraccion * (abajo - arriba)
+            self.create_line(izq, y, der, y, fill="#E3E8ED", dash=(2, 4) if fraccion else ())
+            self.create_text(izq - 8, y, anchor="e", fill=SUAVE, font=(FUENTE, 8),
+                             text=self._formato(bajo + fraccion * (alto_val - bajo)))
+
         n = len(self.puntos)
         paso = (der - izq) / max(self.puntos.maxlen - 1, 1)
         x0 = der - (n - 1) * paso                                      # el último punto queda a la derecha
@@ -346,8 +375,11 @@ class GraficoLinea(tk.Canvas):
         for i, valor in enumerate(self.puntos):
             coords += [x0 + i * paso, abajo - (valor - bajo) / (alto_val - bajo) * (abajo - arriba)]
         if n > 1:
-            self.create_line(*coords, fill=self.color, width=2, joinstyle="round")
+            self.create_polygon(*coords, coords[-2], abajo, coords[0], abajo,
+                                fill=aclarar(self.color, 0.86), outline="")
+            self.create_line(*coords, fill=self.color, width=2, joinstyle="round", capstyle="round")
         x, y = coords[-2], coords[-1]
+        self.create_oval(x - 8, y - 8, x + 8, y + 8, fill=aclarar(self.color, 0.7), outline="")
         self.create_oval(x - 4, y - 4, x + 4, y + 4, fill=self.color, outline=TARJETA, width=2)
 
 
@@ -780,6 +812,14 @@ class VentanaCliente(tk.Tk):
         self.boton_detener.pack(side="left", padx=6)
         self.etiqueta_rec = ttk.Label(control, text="", style="Suave.TLabel")
         self.etiqueta_rec.pack(side="left", padx=6)
+
+        # Trazabilidad: cuándo empezó y terminó la última transmisión.
+        traza = ttk.Frame(self.panel_sensor, style="Tarjeta.TFrame")
+        traza.pack(fill="x", pady=(12, 0))
+        ttk.Label(traza, text="Trazabilidad de la transmisión", style="Titulo.TLabel").pack(anchor="w")
+        self.etiqueta_traza = ttk.Label(traza, text=TEXTO_SIN_TRANSMISION, style="Suave.TLabel",
+                                        wraplength=900, justify="left")
+        self.etiqueta_traza.pack(anchor="w", pady=(4, 0))
         self.buscar_puertos()
 
     # Propósito: datos de red y avance del envío de la pestaña Arduino.
@@ -850,6 +890,9 @@ class VentanaCliente(tk.Tk):
     # Propósito: cerrar el puerto y ocultar el dashboard. Si se grababa, se descarta sin enviar.
     def desconectar_arduino(self, texto="Sin conexión"):
         self._parar_muestreo()
+        if self.grabando:                 # se cortó en plena transmisión: queda registrado y no se envía
+            self.grabadora.cerrar()
+            self._mostrar_traza("Interrumpida (no se envió)")
         self.grabando = False
         self.boton_iniciar.configure(state="normal" if self.emisor is None else "disabled")
         self.boton_detener.configure(state="disabled")
@@ -897,6 +940,17 @@ class VentanaCliente(tk.Tk):
         self._bloquear(False)             # mientras se graba, el envío del CSV queda deshabilitado
         self._tomar_muestra()
 
+    # Propósito: escribir el panel de trazabilidad con el inicio, el cierre (o "en curso"), la duración,
+    # las filas y la frecuencia elegida. 'estado' es el texto de cierre cuando ya terminó o se interrumpió.
+    def _mostrar_traza(self, estado=None):
+        g = self.grabadora
+        cierre = f"{estado}: {formatear_fecha(g.cierre)}" if estado else "Cierre: en curso…"
+        self.etiqueta_traza.configure(
+            text=f"Inicio: {formatear_fecha(g.inicio)}   ·   {cierre}\n"
+                 f"Duración: {formatear_duracion(g.duracion())}   ·   {miles(len(g.registros))} filas   ·   "
+                 f"Frecuencia: {self.combo_tasa.get()}",
+            foreground=TEXTO if estado is None else SUAVE)
+
     # Propósito: guardar una fila con la última lectura vigente y reprogramarse según la tasa elegida.
     def _tomar_muestra(self):
         if not self.grabando:
@@ -904,6 +958,7 @@ class VentanaCliente(tk.Tk):
         self.grabadora.muestrear(self.lector.ultima() if self.lector else None)
         self.etiqueta_rec.configure(
             text=f"● Transmitiendo · {miles(len(self.grabadora.registros))} filas", foreground=ERROR)
+        self._mostrar_traza()
         intervalo = sensor_arduino.TASAS[self.combo_tasa.get()]
         self._id_muestreo = self.after(int(intervalo * 1000), self._tomar_muestra)
 
@@ -920,7 +975,9 @@ class VentanaCliente(tk.Tk):
         self.grabando = False
         self.boton_detener.configure(state="disabled")
         self.combo_tasa.configure(state="readonly")
+        self.grabadora.cerrar()           # momento exacto en que el usuario detuvo la transmisión
         registros = self.grabadora.registros
+        self._mostrar_traza("Cierre")
         if not registros:
             self.boton_iniciar.configure(state="normal")
             self.etiqueta_rec.configure(text="⚠ No se capturó ninguna fila (¿el sensor envía datos?).",
