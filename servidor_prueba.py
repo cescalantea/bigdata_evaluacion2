@@ -305,11 +305,7 @@ def recibir_contrato(conexion, detener=None, on_sensor=None):
 
 
 def atender(conexion, registrar=print):
-    """Adaptador histórico sin GUI, con el mismo receptor y validaciones oficiales.
-
-    Su ACK significa disponible en el resultado retornado; la GUI oficial espera
-    además la aplicación del dataset en el hilo principal.
-    """
+    """Adaptador histórico sin GUI, con el mismo receptor y validaciones oficiales."""
     registros = []
     try:
         registros = decodificar(recibir_todo(conexion))
@@ -934,7 +930,10 @@ class ServidorBigData(tk.Tk):
             logging.info("Persistencia %s: %s", nombre, info)
         return resultados
 
+    # Propósito: recibir, validar y aplicar los datos en la interfaz ANTES de responder el ACK.
+    # Así "ok: true" significa "recibido y aceptado", no solo "recibido".
     def _atender_cliente(self, conexion):
+        inicio = time.time()
         try:
             # El puerto CSV conserva el contrato de Evaluacion 2.
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
@@ -1057,7 +1056,7 @@ class ServidorBigData(tk.Tk):
         self.cola.put(lambda total=total: self._mostrar_estado(
             f"● Sensor recibido, no guardado en MongoDB: {total} lectura(s).", AVISO))
 
-    def _datos_recibidos(self, df_nuevo):
+    def _datos_recibidos(self, df_nuevo, demora=0.0):
         self._version_filtro += 1
         self._orden = None
         self.entry_filtro.delete(0, tk.END)
@@ -1268,22 +1267,66 @@ class ServidorPrueba(ServidorBigData):
     def _atender_cliente(self, conexion):
         try:
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
-            df = dataframe_validado(registros)
-            self.cola.put(lambda: self._datos_recibidos(df))
-            responder(conexion, {"ok": True, "filas": len(df), "detalle": "Recepción correcta."})
+            df_nuevo = dataframe_validado(registros)
+            del registros
+            
+            demora = time.time() - inicio  # ⏱️ 2. Calculamos tiempo de red y procesamiento
+            
+            aceptado = threading.Event()
+            cancelado = threading.Event()
+            decision = threading.Lock()
+            resultado = {}
+            
+            # La decisión, su aplicación y la señal se realizan en el hilo Tk.
+            def aceptar():
+                with decision:
+                    anterior = self.df_recibido, self.df_actual, self.pagina_actual
+                    try:
+                        if cancelado.is_set() or self.detener_escucha.is_set() or self._cerrando:
+                            raise ValueError("Transferencia cancelada: servidor detenido o aceptación vencida.")
+                        
+                        # 🎨 3. Pasamos los datos y el tiempo a la interfaz gráfica
+                        self._datos_recibidos(df_nuevo, demora)
+                        self._mostrar_estado("● Recepción completada. Servidor a la escucha.", EXITO)
+                        
+                        resultado.update(ok=True, filas=len(df_nuevo))
+                    except Exception as error:
+                        self.df_recibido, self.df_actual, self.pagina_actual = anterior
+                        resultado.update(ok=False, filas=0, detalle=str(error))
+                    finally:
+                        aceptado.set()
+            
+            self.cola.put(aceptar)
+            limite = time.monotonic() + TIEMPO_ESPERA
+            
+            # 🔒 4. Esperamos estrictamente a que la GUI avise que terminó antes del ACK
+            while not aceptado.wait(PASO_ESPERA):
+                if self.detener_escucha.is_set() or time.monotonic() > limite:
+                    with decision:
+                        if aceptado.is_set():
+                            break
+                        cancelado.set()
+                    raise ValueError("Transferencia cancelada o tiempo de aceptación agotado.")
+            
+            # ✅ 5. Enviamos el ACK final
+            responder(conexion, resultado)
+            
         except Exception as error:
+            mensaje = str(error)
             try:
-                responder(conexion, {"ok": False, "filas": 0, "detalle": str(error)})
+                responder(conexion, {"ok": False, "filas": 0, "detalle": mensaje})
             except OSError:
                 pass
+            self.cola.put(lambda texto=mensaje: self._mostrar_estado(
+                f"● Error en transferencia: {texto}", ERROR))
         finally:
             conexion.close()
             hilo_actual = threading.current_thread()
             with self._hilos_clientes_lock:
                 self._hilos_clientes.discard(hilo_actual)
 
-    def _datos_recibidos(self, df_nuevo):
-        super()._datos_recibidos(df_nuevo)
+    def _datos_recibidos(self, df_nuevo, demora=0.0):
+        super()._datos_recibidos(df_nuevo, demora)
         self.registro.configure(state="normal")
         self.registro.insert("end", f"{len(df_nuevo)} filas recibidas\n")
         self.registro.configure(state="disabled")
