@@ -13,7 +13,7 @@ python servidor_prueba.py
 
 En Neon, seleccionar BigData_Socket / production / neondb y copiar la URL de conexion a `DATABASE_URL` en `.env`. Debe incluir SSL (`sslmode=require`, o verificacion de certificado). Codificar caracteres especiales de usuario/contrasena en URL. No publicar este archivo; `.gitignore` ya lo excluye. URL vacia deshabilita SQL. Las tablas existentes deben estar en `public` y el usuario necesita SELECT, INSERT, acceso a la secuencia identity y permiso para tablas temporales. No hay migraciones permanentes.
 
-`POSTGRES_BATCH_SIZE=10000` controla el recorrido de filas COPY; no produce INSERT individuales ni COMMIT por lote. `POSTGRES_CONNECT_TIMEOUT=15` limita la conexion y `POSTGRES_STATEMENT_TIMEOUT_MS=300000` cada sentencia SQL y espera por bloqueos. No constituyen un limite total de carga.
+`POSTGRES_BATCH_SIZE=20000` controla el recorrido de filas COPY; no produce INSERT individuales ni COMMIT por lote. `POSTGRES_CONNECT_TIMEOUT=15` limita la conexion y `POSTGRES_STATEMENT_TIMEOUT_MS=300000` cada sentencia SQL y espera por bloqueos. No constituyen un limite total de carga.
 
 ## Flujo
 

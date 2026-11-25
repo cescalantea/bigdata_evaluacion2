@@ -42,7 +42,7 @@ class SQLRepositorio:
     def __init__(self):
         load_dotenv()
         self.url = os.getenv('DATABASE_URL', '').strip()
-        self.tamano_lote = int(os.getenv('POSTGRES_BATCH_SIZE', '10000'))
+        self.tamano_lote = int(os.getenv('POSTGRES_BATCH_SIZE', '20000'))
         # Se conservan estos valores de respaldo por compatibilidad; la
         # configuracion recomendada queda definida en el archivo .env.
         self.timeout = int(os.getenv('POSTGRES_CONNECT_TIMEOUT', '10'))
@@ -51,11 +51,15 @@ class SQLRepositorio:
             raise ValueError('Los limites PostgreSQL deben ser positivos.')
         if self.url:
             uri = urlsplit(self.url)
-            modo = parse_qs(uri.query).get('sslmode', ['require'])[-1]
             if uri.scheme not in ('postgresql', 'postgres') or not uri.hostname:
                 raise ValueError('DATABASE_URL debe ser una URL PostgreSQL valida.')
-            if modo not in ('require', 'verify-ca', 'verify-full'):
-                raise ValueError('PostgreSQL requiere SSL.')
+            host_local = uri.hostname.lower() in ('localhost', '127.0.0.1', '::1')
+            modo_predeterminado = 'disable' if host_local else 'require'
+            modo = parse_qs(uri.query).get('sslmode', [modo_predeterminado])[-1]
+            if modo not in ('disable', 'require', 'verify-ca', 'verify-full'):
+                raise ValueError('sslmode de PostgreSQL no es valido.')
+            if modo == 'disable' and not host_local:
+                raise ValueError('sslmode=disable solo se permite para PostgreSQL local.')
             self.sslmode = modo
         self._conexion = None
         self._lock = threading.Lock()

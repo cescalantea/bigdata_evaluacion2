@@ -125,7 +125,7 @@ Crear `.env` desde el ejemplo solo si aún no existe y completar localmente la U
 
 ```dotenv
 DATABASE_URL=postgresql://usuario:password@host.neon.tech/neondb?sslmode=require
-POSTGRES_BATCH_SIZE=10000
+POSTGRES_BATCH_SIZE=20000
 POSTGRES_CONNECT_TIMEOUT=15
 POSTGRES_STATEMENT_TIMEOUT_MS=300000
 ```
