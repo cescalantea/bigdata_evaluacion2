@@ -13,11 +13,11 @@ python servidor_prueba.py
 
 En Neon, seleccionar BigData_Socket / production / neondb y copiar la URL de conexion a `DATABASE_URL` en `.env`. Debe incluir SSL (`sslmode=require`, o verificacion de certificado). Codificar caracteres especiales de usuario/contrasena en URL. No publicar este archivo; `.gitignore` ya lo excluye. URL vacia deshabilita SQL. Las tablas existentes deben estar en `public` y el usuario necesita SELECT, INSERT, acceso a la secuencia identity y permiso para tablas temporales. No hay migraciones permanentes.
 
-`POSTGRES_BATCH_SIZE=1000` controla el recorrido de filas COPY; no produce INSERT individuales ni COMMIT por lote. `POSTGRES_CONNECT_TIMEOUT=10` limita la conexion y `POSTGRES_STATEMENT_TIMEOUT_MS=45000` cada sentencia SQL y espera por bloqueos. No constituyen un limite total de carga.
+`POSTGRES_BATCH_SIZE=10000` controla el recorrido de filas COPY; no produce INSERT individuales ni COMMIT por lote. `POSTGRES_CONNECT_TIMEOUT=15` limita la conexion y `POSTGRES_STATEMENT_TIMEOUT_MS=300000` cada sentencia SQL y espera por bloqueos. No constituyen un limite total de carga.
 
 ## Flujo
 
-El trabajador TCP original recibe JSON terminado en `<EOF>`, valida el mensaje y construye un unico DataFrame. Intenta MongoDB y PostgreSQL independientemente, conserva resultados en `_ultima_persistencia`, actualiza la GUI mediante su cola y envia ACK. No se cambian cliente, puertos, sensores ni JSON entrante. El ACK positivo conserva exactamente `{"ok": true, "filas": N}`; confirma recepcion incluso si las bases estan deshabilitadas o SQL se omite por columnas, como en la demo original. La GUI indica estas condiciones. Un fallo de escritura produce ACK negativo con filas recibidas, detalle y resultados por destino; nunca anuncia persistencia total.
+El trabajador TCP original recibe JSON terminado en `<EOF>`, valida el mensaje y construye un unico DataFrame. Inicia MongoDB y PostgreSQL en paralelo, conserva resultados y duraciones en `_ultima_persistencia`, actualiza la GUI mediante su cola y envia ACK de recepcion. No se cambian cliente, puertos, sensores ni JSON entrante. La GUI diferencia recepcion completada de persistencia finalizada.
 
 `SQLRepositorio` carga dotenv y valida configuracion. Antes de conectar valida exactamente las ocho columnas, fechas ISO, INTEGER, textos, coordenadas, valores finitos, precision/escala NUMERIC, caudales y areas no negativos. Usa Decimal desde la representacion recibida: no recupera precision que el cliente ya haya perdido al leer CSV. Rechaza redondeos implicitos, metadatos contradictorios y valores distintos para la misma clave de medicion. Colapsa duplicados identicos del propio envio.
 

@@ -1,12 +1,13 @@
 """
 Script para recibir datos por sockets y mostrarlos en una tabla con filtros,
-ordenamiento, dashboard estadístico (Matplotlib) y persistencia en MongoDB.
+ordenamiento, dashboard estadístico (Matplotlib) y persistencia en MongoDB y PostgreSQL.
 Autor: Grupo 4 — Mamani, Perea, Pinedo, Vargas, Vergara.
 Licencia: solo educacional.
 Fecha creación: 16-10-2026.
-Fecha modificación: 19-11-2026.
+Fecha modificación: 22-11-2026.
 Modificaciones: integración de doble puerto (CSV y sensores), persistencia en
-MongoDB Atlas y pestaña de Dashboard Estadístico descriptivo con Matplotlib.
+MongoDB Atlas y PostgreSQL Neon, pestaña de Dashboard Estadístico con Matplotlib
+y ventana independiente (Toplevel) con barra de herramientas interactiva.
 
 SERVIDOR OFICIAL (Grupo 4) - Dashboard de Ingesta Big Data.
 
@@ -24,6 +25,7 @@ import time
 import logging
 import math
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import ttk
 import pandas as pd
@@ -39,7 +41,7 @@ if load_dotenv is not None:
 
 try:
     from matplotlib.figure import Figure
-    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
     MATPLOTLIB_DISPONIBLE = True
 except ImportError:
     MATPLOTLIB_DISPONIBLE = False
@@ -305,7 +307,11 @@ def recibir_contrato(conexion, detener=None, on_sensor=None):
 
 
 def atender(conexion, registrar=print):
-    """Adaptador histórico sin GUI, con el mismo receptor y validaciones oficiales."""
+    """Adaptador histórico sin GUI, con el mismo receptor y validaciones oficiales.
+
+    Su ACK significa disponible en el resultado retornado; la GUI oficial espera
+    además la aplicación del dataset en el hilo principal.
+    """
     registros = []
     try:
         registros = decodificar(recibir_todo(conexion))
@@ -336,8 +342,8 @@ class MongoRepositorio:
         self.uri = os.environ.get("MONGODB_URI", "").strip()
         self.nombre_bd = os.environ.get("MONGODB_DB", "bigdata_eval3").strip()
         self.coleccion_csv = os.environ.get("MONGODB_COLLECTION_CSV", "datos_csv").strip()
-        self.tamano_lote = int(os.environ.get("MONGODB_BATCH_SIZE", "1000"))
-        self.timeout_ms = int(os.environ.get("MONGODB_TIMEOUT_MS", "5000"))
+        self.tamano_lote = int(os.environ.get("MONGODB_BATCH_SIZE", "10000"))
+        self.timeout_ms = int(os.environ.get("MONGODB_TIMEOUT_MS", "15000"))
         self.max_intentos = int(os.environ.get("MONGODB_MAX_ATTEMPTS", "3"))
         self.delay_reintento = float(os.environ.get("MONGODB_RETRY_DELAY", "2"))
         if (self.tamano_lote <= 0 or self.timeout_ms <= 0 or
@@ -421,34 +427,52 @@ class MongoRepositorio:
         return valor
 
     def guardar_dataframe(self, dataframe, transferencia_id=None):
-        """Guarda cada fila con las columnas CSV como campos del documento."""
+        """Guarda cada fila en MongoDB evitando duplicados mediante _id determinístico."""
         if not self.habilitado:
-            return {"habilitado": False, "insertados": 0, "transferencia_id": None}
+            return {"habilitado": False, "insertados": 0, "existentes": 0, "transferencia_id": None}
         if dataframe is None:
             raise ValueError("No se puede guardar un DataFrame inexistente en MongoDB.")
         self.conectar()
         transferencia_id = transferencia_id or uuid.uuid4().hex
         coleccion = self._db[self.coleccion_csv]
         insertados = 0
-        from pymongo.errors import PyMongoError
+        existentes = 0
+        from pymongo.errors import BulkWriteError, PyMongoError
+
         try:
             for inicio in range(0, len(dataframe), self.tamano_lote):
                 filas = dataframe.iloc[inicio:inicio + self.tamano_lote].to_dict("records")
-                documentos = [
-                    {
-                        str(clave): self._valor_mongo(valor)
-                        for clave, valor in fila.items()
-                    }
-                    for fila in filas
-                ]
-                coleccion.insert_many(documentos, ordered=False)
-                insertados += len(documentos)
+                documentos = []
+                for fila in filas:
+                    doc = {str(clave): self._valor_mongo(valor) for clave, valor in fila.items()}
+                    # Si vienen estacion_id y fecha, usamos clave compuesta como _id único
+                    if doc.get("estacion_id") is not None and doc.get("fecha") is not None:
+                        doc["_id"] = f"{doc['estacion_id']}_{doc['fecha']}"
+                    documentos.append(doc)
+
+                try:
+                    res = coleccion.insert_many(documentos, ordered=False)
+                    insertados += len(res.inserted_ids)
+                except BulkWriteError as bwe:
+                    errores = bwe.details.get("writeErrors", [])
+                    # Si algún error NO es por clave duplicada (código 11000), sí es un fallo real
+                    if any(e.get("code") != 11000 for e in errores):
+                        raise
+                    nuevos_lote = bwe.details.get("nInserted", 0)
+                    insertados += nuevos_lote
+                    existentes += len(documentos) - nuevos_lote
         except PyMongoError as error:
             logging.exception("MongoDB no confirmo un lote de datos CSV.")
             raise RuntimeError(
                 "MongoDB no confirmo la escritura del lote CSV; revise la conexion."
             ) from error
-        return {"habilitado": True, "insertados": insertados, "transferencia_id": transferencia_id}
+
+        return {
+            "habilitado": True,
+            "insertados": insertados,
+            "existentes": existentes,
+            "transferencia_id": transferencia_id,
+        }
 
     def cerrar(self):
         """Cierra el cliente MongoDB al salir de la aplicacion."""
@@ -482,19 +506,33 @@ class DashboardEstadistico(ttk.Frame):
     def __init__(self, padre):
         super().__init__(padre, style="Fondo.TFrame", padding=(0, 8, 0, 0))
         self._canvas = None
+        self._ultimos_datos = None
+        self._ventana_graficos = None
         self._crear_interfaz()
 
     def _crear_interfaz(self):
-        # 1. Tarjeta superior: KPIs generales y estado
+        # 1. Tarjeta superior: KPIs generales y botón de ventana aparte
         panel_kpi = Tarjeta(self, "Resumen Estadístico del CSV (Solo consulta)")
         panel_kpi.pack(fill="x", pady=(0, 10))
 
+        fila_kpi = ttk.Frame(panel_kpi, style="Tarjeta.TFrame")
+        fila_kpi.pack(fill="x")
+
         self.lbl_resumen = tk.Label(
-            panel_kpi,
+            fila_kpi,
             text="Esperando la recepción de un archivo CSV para calcular estadísticas...",
             bg=TARJETA, fg=SUAVE, font=(FUENTE, 10, "bold"), anchor="w"
         )
-        self.lbl_resumen.pack(fill="x")
+        self.lbl_resumen.pack(side="left", fill="x", expand=True)
+
+        self.btn_ventana = ttk.Button(
+            fila_kpi,
+            text="Abrir gráficos en ventana aparte",
+            style="Acento.TButton",
+            command=self.abrir_ventana_graficos,
+            state="disabled"
+        )
+        self.btn_ventana.pack(side="right", padx=(10, 0))
 
         # 2. Tabla de medidas descriptivas por columna numérica
         panel_stats = Tarjeta(self, "Medidas Básicas por Variable Numérica")
@@ -578,33 +616,10 @@ class DashboardEstadistico(ttk.Frame):
             "cat_conteos": cat_conteos,
         }
 
-    def actualizar_vista(self, datos):
-        """Dibuja las métricas y gráficos en el hilo principal de Tkinter."""
-        self.lbl_resumen.configure(
-            text=f"● Total analizado: {miles(datos['total_filas'])} registros · "
-                 f"{datos['total_cols']} columnas · {len(datos['numericas'])} variables numéricas.",
-            fg=EXITO
-        )
-
-        self.tabla_stats.delete(*self.tabla_stats.get_children())
-        for item in datos["numericas"]:
-            self.tabla_stats.insert("", "end", values=(
-                item["columna"],
-                miles(item["validos"]),
-                f"{item['promedio']:.2f}",
-                f"{item['minimo']:.2f}",
-                f"{item['maximo']:.2f}",
-                f"{item['std']:.2f}",
-            ))
-
-        if not MATPLOTLIB_DISPONIBLE:
-            return
-
-        if self._canvas is not None:
-            self._canvas.get_tk_widget().destroy()
-            self._canvas = None
-
-        fig = Figure(figsize=(9, 3.6), dpi=95, facecolor=TARJETA)
+    @staticmethod
+    def _construir_figura(datos, figsize=(9, 3.6)):
+        """Construye la figura de Matplotlib reutilizable en la pestaña o ventana aparte."""
+        fig = Figure(figsize=figsize, dpi=95, facecolor=TARJETA)
         ax1 = fig.add_subplot(121)
         ax2 = fig.add_subplot(122)
 
@@ -635,9 +650,70 @@ class DashboardEstadistico(ttk.Frame):
             ax2.set_axis_off()
 
         fig.tight_layout(pad=2.0)
+        return fig
+
+    def actualizar_vista(self, datos):
+        """Dibuja las métricas y gráficos en el hilo principal de Tkinter."""
+        self._ultimos_datos = datos
+        self.lbl_resumen.configure(
+            text=f"● Total analizado: {miles(datos['total_filas'])} registros · "
+                 f"{datos['total_cols']} columnas · {len(datos['numericas'])} variables numéricas.",
+            fg=EXITO
+        )
+
+        self.tabla_stats.delete(*self.tabla_stats.get_children())
+        for item in datos["numericas"]:
+            self.tabla_stats.insert("", "end", values=(
+                item["columna"],
+                miles(item["validos"]),
+                f"{item['promedio']:.2f}",
+                f"{item['minimo']:.2f}",
+                f"{item['maximo']:.2f}",
+                f"{item['std']:.2f}",
+            ))
+
+        if not MATPLOTLIB_DISPONIBLE:
+            return
+
+        self.btn_ventana.configure(state="normal")
+
+        if self._canvas is not None:
+            self._canvas.get_tk_widget().destroy()
+            self._canvas = None
+
+        fig = self._construir_figura(datos, figsize=(9, 3.6))
         self._canvas = FigureCanvasTkAgg(fig, master=self.panel_graficos)
         self._canvas.draw()
         self._canvas.get_tk_widget().pack(fill="both", expand=True)
+
+        # Si la ventana flotante ya estaba abierta, la refresca con el nuevo CSV
+        if self._ventana_graficos is not None and self._ventana_graficos.winfo_exists():
+            self._ventana_graficos.destroy()
+            self.abrir_ventana_graficos()
+
+    def abrir_ventana_graficos(self):
+        """Abre los gráficos en una ventana Toplevel con barra de herramientas Matplotlib."""
+        if not MATPLOTLIB_DISPONIBLE or self._ultimos_datos is None:
+            return
+
+        if self._ventana_graficos is not None and self._ventana_graficos.winfo_exists():
+            self._ventana_graficos.lift()
+            self._ventana_graficos.focus_force()
+            return
+
+        ventana = tk.Toplevel(self)
+        ventana.title("Gráficos Estadísticos · Grupo 4")
+        ventana.geometry("1100x580")
+        ventana.configure(bg=TARJETA)
+        self._ventana_graficos = ventana
+
+        fig = self._construir_figura(self._ultimos_datos, figsize=(11, 5.0))
+        canvas = FigureCanvasTkAgg(fig, master=ventana)
+        canvas.draw()
+
+        toolbar = NavigationToolbar2Tk(canvas, ventana)
+        toolbar.update()
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
 
 # ---------------------------------------------------------------------------
@@ -917,8 +993,16 @@ class ServidorBigData(tk.Tk):
                 self.cola.put(self._al_detenerse)
 
     def _persistir_dataframe(self, dataframe):
-        resultados = {}
-        for nombre, repositorio in (("MongoDB", self.mongo), ("PostgreSQL", self.sql)):
+        """Persiste el mismo CSV en ambas nubes en paralelo.
+
+        La recepción y la GUI ya se ejecutan fuera de este trabajo. Aquí se
+        separan también las dos escrituras para que el tiempo total sea el de
+        la base más lenta, en lugar de sumar MongoDB y PostgreSQL.
+        """
+        repositorios = (("MongoDB", self.mongo), ("PostgreSQL", self.sql))
+
+        def guardar(nombre, repositorio):
+            inicio = time.perf_counter()
             try:
                 info = repositorio.guardar_dataframe(dataframe)
                 info.setdefault("estado", "guardado" if info["habilitado"] else "deshabilitado")
@@ -926,23 +1010,30 @@ class ServidorBigData(tk.Tk):
                 # No propagar mensajes del driver: pueden contener secretos.
                 info = dict(estado="fallido", insertados=0,
                             detalle="Escritura no confirmada; puede requerir revision de carga parcial.")
-            resultados[nombre] = info
-            logging.info("Persistencia %s: %s", nombre, info)
+            info["duracion_s"] = round(time.perf_counter() - inicio, 2)
+            logging.info("Persistencia %s: %s (%.2f s)", nombre, info, info["duracion_s"])
+            return nombre, info
+
+        resultados = {}
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="persistencia-db") as ejecutor:
+            tareas = [ejecutor.submit(guardar, nombre, repositorio)
+                      for nombre, repositorio in repositorios]
+            for tarea in as_completed(tareas):
+                nombre, info = tarea.result()
+                resultados[nombre] = info
+
+        # Mantiene el orden visual estable, aunque las tareas terminen en
+        # distinto orden.
+        resultados = {nombre: resultados[nombre] for nombre, _ in repositorios}
         return resultados
 
-    # Propósito: recibir, validar y aplicar los datos en la interfaz ANTES de responder el ACK.
-    # Así "ok: true" significa "recibido y aceptado", no solo "recibido".
     def _atender_cliente(self, conexion):
-        inicio = time.time()
         try:
-            # El puerto CSV conserva el contrato de Evaluacion 2.
+            # 1. Recibir y validar el CSV
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
             df_nuevo = dataframe_validado(registros)
             del registros
-            # La insercion ocurre fuera del hilo de Tkinter para no congelar la GUI.
-            # Sin MONGODB_URI configurada, este paso no modifica la demo local.
-            persistencia = self._persistir_dataframe(df_nuevo)
-            self._ultima_persistencia = persistencia
+
             aceptado = threading.Event()
             cancelado = threading.Event()
             decision = threading.Lock()
@@ -954,22 +1045,15 @@ class ServidorBigData(tk.Tk):
                     try:
                         if cancelado.is_set() or self.detener_escucha.is_set() or self._cerrando:
                             raise ValueError("Transferencia cancelada: servidor detenido o aceptación vencida.")
+                        # 2. Mostrar datos en tabla y dashboard de inmediato
                         self._datos_recibidos(df_nuevo)
-                        resumen = "; ".join(
-                            f"{base}: {info['estado']} ({info.get('insertados', 0)} insertados)"
-                            + (f"; {info['detalle']}" if info.get('detalle') else "")
-                            for base, info in persistencia.items())
-                        fallo = any(r['estado'] == 'fallido' for r in persistencia.values())
                         self._mostrar_estado_datos(
-                            f"Datos recibidos: {miles(len(df_nuevo))}. {resumen}",
-                            AVISO if fallo else EXITO)
-                        self._mostrar_estado("Recepcion completada. " + resumen,
-                                             AVISO if fallo else EXITO)
-                        if fallo:
-                            resultado.update(ok=False, filas=len(df_nuevo), detalle=resumen,
-                                             persistencia=persistencia)
-                        else:
-                            resultado.update(ok=True, filas=len(df_nuevo))
+                            f"● Datos recibidos: {miles(len(df_nuevo))}. Guardando en MongoDB y PostgreSQL...",
+                            AVISO)
+                        self._mostrar_estado(
+                            "● Recepción completada. Persistiendo en bases de datos en segundo plano...",
+                            AVISO)
+                        resultado.update(ok=True, filas=len(df_nuevo))
                     except Exception as error:
                         self.df_recibido, self.df_actual, self.pagina_actual = anterior
                         resultado.update(ok=False, filas=0, detalle=str(error))
@@ -985,7 +1069,31 @@ class ServidorBigData(tk.Tk):
                             break
                         cancelado.set()
                     raise ValueError("Transferencia cancelada o tiempo de aceptación agotado.")
+
+            # 3. Responder ACK al cliente inmediatamente (evita el timeout)
             responder(conexion, resultado)
+
+            # 4. Ejecutar la doble persistencia en segundo plano sin bloquear la GUI
+            if resultado.get("ok"):
+                def persistir_en_fondo():
+                    persistencia = self._persistir_dataframe(df_nuevo)
+                    self._ultima_persistencia = persistencia
+                    resumen = "; ".join(
+                        f"{base}: {info['estado']} ({miles(info.get('insertados', 0))} nuevos"
+                        + (f", {miles(info['existentes'])} ya existentes" if info.get('existentes') else "")
+                        + ")"
+                        + (f" en {info['duracion_s']:.2f} s" if info.get('duracion_s') is not None else "")
+                        + (f"; {info['detalle']}" if info.get('detalle') else "")
+                        for base, info in persistencia.items())
+                    fallo = any(r['estado'] == 'fallido' for r in persistencia.values())
+                    color = AVISO if fallo else EXITO
+                    self.cola.put(lambda: None if self._cerrando else (
+                        self._mostrar_estado_datos(f"Datos recibidos: {miles(len(df_nuevo))}. {resumen}", color),
+                        self._mostrar_estado("Persistencia finalizada. " + resumen, color)
+                    ))
+
+                threading.Thread(target=persistir_en_fondo, daemon=True).start()
+
         except Exception as error:
             mensaje = str(error)
             try:
@@ -1056,7 +1164,7 @@ class ServidorBigData(tk.Tk):
         self.cola.put(lambda total=total: self._mostrar_estado(
             f"● Sensor recibido, no guardado en MongoDB: {total} lectura(s).", AVISO))
 
-    def _datos_recibidos(self, df_nuevo, demora=0.0):
+    def _datos_recibidos(self, df_nuevo):
         self._version_filtro += 1
         self._orden = None
         self.entry_filtro.delete(0, tk.END)
@@ -1267,66 +1375,22 @@ class ServidorPrueba(ServidorBigData):
     def _atender_cliente(self, conexion):
         try:
             registros = decodificar(recibir_todo(conexion, self.detener_escucha))
-            df_nuevo = dataframe_validado(registros)
-            del registros
-            
-            demora = time.time() - inicio  # ⏱️ 2. Calculamos tiempo de red y procesamiento
-            
-            aceptado = threading.Event()
-            cancelado = threading.Event()
-            decision = threading.Lock()
-            resultado = {}
-            
-            # La decisión, su aplicación y la señal se realizan en el hilo Tk.
-            def aceptar():
-                with decision:
-                    anterior = self.df_recibido, self.df_actual, self.pagina_actual
-                    try:
-                        if cancelado.is_set() or self.detener_escucha.is_set() or self._cerrando:
-                            raise ValueError("Transferencia cancelada: servidor detenido o aceptación vencida.")
-                        
-                        # 🎨 3. Pasamos los datos y el tiempo a la interfaz gráfica
-                        self._datos_recibidos(df_nuevo, demora)
-                        self._mostrar_estado("● Recepción completada. Servidor a la escucha.", EXITO)
-                        
-                        resultado.update(ok=True, filas=len(df_nuevo))
-                    except Exception as error:
-                        self.df_recibido, self.df_actual, self.pagina_actual = anterior
-                        resultado.update(ok=False, filas=0, detalle=str(error))
-                    finally:
-                        aceptado.set()
-            
-            self.cola.put(aceptar)
-            limite = time.monotonic() + TIEMPO_ESPERA
-            
-            # 🔒 4. Esperamos estrictamente a que la GUI avise que terminó antes del ACK
-            while not aceptado.wait(PASO_ESPERA):
-                if self.detener_escucha.is_set() or time.monotonic() > limite:
-                    with decision:
-                        if aceptado.is_set():
-                            break
-                        cancelado.set()
-                    raise ValueError("Transferencia cancelada o tiempo de aceptación agotado.")
-            
-            # ✅ 5. Enviamos el ACK final
-            responder(conexion, resultado)
-            
+            df = dataframe_validado(registros)
+            self.cola.put(lambda: self._datos_recibidos(df))
+            responder(conexion, {"ok": True, "filas": len(df), "detalle": "Recepción correcta."})
         except Exception as error:
-            mensaje = str(error)
             try:
-                responder(conexion, {"ok": False, "filas": 0, "detalle": mensaje})
+                responder(conexion, {"ok": False, "filas": 0, "detalle": str(error)})
             except OSError:
                 pass
-            self.cola.put(lambda texto=mensaje: self._mostrar_estado(
-                f"● Error en transferencia: {texto}", ERROR))
         finally:
             conexion.close()
             hilo_actual = threading.current_thread()
             with self._hilos_clientes_lock:
                 self._hilos_clientes.discard(hilo_actual)
 
-    def _datos_recibidos(self, df_nuevo, demora=0.0):
-        super()._datos_recibidos(df_nuevo, demora)
+    def _datos_recibidos(self, df_nuevo):
+        super()._datos_recibidos(df_nuevo)
         self.registro.configure(state="normal")
         self.registro.insert("end", f"{len(df_nuevo)} filas recibidas\n")
         self.registro.configure(state="disabled")

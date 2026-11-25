@@ -23,7 +23,7 @@ La implementación MongoDB se conserva. El cliente sigue enviando el JSON termin
 
 En `ServidorBigData.__init__()` se crea `self.sql = SQLRepositorio()`, junto al repositorio MongoDB existente.
 
-En `_atender_cliente()`, después de recibir y validar el JSON y construir `df_nuevo`, se llama a `_persistir_dataframe(df_nuevo)`. Este método intenta guardar primero en MongoDB y después en PostgreSQL. Cada destino tiene manejo de errores independiente: si MongoDB falla, PostgreSQL se intenta igualmente, y viceversa.
+En `_atender_cliente()`, después de recibir y validar el JSON y construir `df_nuevo`, se llama a `_persistir_dataframe(df_nuevo)`. Este método inicia en paralelo la persistencia en MongoDB y PostgreSQL. Cada destino tiene manejo de errores y medición de tiempo independiente: si una base falla, la otra se intenta igualmente.
 
 ```text
 Cliente: CSV → JSON + <EOF>
@@ -125,9 +125,9 @@ Crear `.env` desde el ejemplo solo si aún no existe y completar localmente la U
 
 ```dotenv
 DATABASE_URL=postgresql://usuario:password@host.neon.tech/neondb?sslmode=require
-POSTGRES_BATCH_SIZE=1000
-POSTGRES_CONNECT_TIMEOUT=10
-POSTGRES_STATEMENT_TIMEOUT_MS=45000
+POSTGRES_BATCH_SIZE=10000
+POSTGRES_CONNECT_TIMEOUT=15
+POSTGRES_STATEMENT_TIMEOUT_MS=300000
 ```
 
 Los valores de la URL anterior son ficticios. El archivo `.env` está excluido por `.gitignore`. Deben conservarse las variables MongoDB necesarias para usar ambos destinos.

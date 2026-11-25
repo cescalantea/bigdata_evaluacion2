@@ -42,7 +42,9 @@ class SQLRepositorio:
     def __init__(self):
         load_dotenv()
         self.url = os.getenv('DATABASE_URL', '').strip()
-        self.tamano_lote = int(os.getenv('POSTGRES_BATCH_SIZE', '1000'))
+        self.tamano_lote = int(os.getenv('POSTGRES_BATCH_SIZE', '10000'))
+        # Se conservan estos valores de respaldo por compatibilidad; la
+        # configuracion recomendada queda definida en el archivo .env.
         self.timeout = int(os.getenv('POSTGRES_CONNECT_TIMEOUT', '10'))
         self.statement_timeout = int(os.getenv('POSTGRES_STATEMENT_TIMEOUT_MS', '45000'))
         if min(self.tamano_lote, self.timeout, self.statement_timeout) <= 0:
