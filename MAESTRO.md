@@ -31,11 +31,8 @@ El servidor recibe, valida, y muestra los datos en una tabla con búsqueda, orde
 
 ```mermaid
 flowchart TD
-    A["Archivo CSV<br/>569.250 filas"] --> C
-    B["Arduino Uno<br/>DHT11 + MQ-2"] -->|"USB, pyserial<br/>9600 baudios"| C
-    S["Simulador de Arduino<br/>solo pruebas"] -.->|"socket://127.0.0.1:5577"| C
-    C["CLIENTE · Grupo 3<br/>cliente.py"] -->|"Socket TCP<br/>JSON + EOF"| D["SERVIDOR · Grupo 4<br/>servidor_prueba.py"]
-    D -->|"ACK en JSON"| C
+    F["Fuentes de datos<br/>CSV de 569.250 filas<br/>Arduino por USB, o simulador"] -->|"archivo o puerto serie<br/>pyserial, 9600 baudios"| C["CLIENTE · Grupo 3<br/>cliente.py"]
+    C -->|"Socket TCP<br/>JSON + EOF, ACK de vuelta"| D["SERVIDOR · Grupo 4<br/>servidor_prueba.py"]
     D --> E["Tabla con filtro,<br/>orden y paginación"]
 ```
 
@@ -69,6 +66,7 @@ con el otro grupo.**
 | `simulador_arduino.py` | Simulador de Arduino (ventana aparte, solo pruebas) | Grupo 3 |
 | `servidor_prueba.py` | Servidor con dashboard | Grupo 4 |
 | `scrip_arduino_sensor_v3.txt` | Código para la placa (1 línea por segundo) | Grupo 3 |
+| `requirements.txt`, `requirements-dev.txt` | Dependencias para ejecutar y para desarrollar | Grupo 3 |
 | `tests/` | Pruebas automáticas (116) | ambos |
 | `docs/` | Informes y documentación detallada | ambos |
 
@@ -76,11 +74,24 @@ con el otro grupo.**
 
 ## 3. Cómo ejecutarla
 
-**Requisitos:** Python 3.10 o superior (se probó con 3.14).
+**Requisitos:** Python 3.10 o superior (se probó con 3.14). Tkinter y `socket` vienen con
+Python; el resto se instala con `pip`.
+
+**Instalación** (una sola vez, desde la carpeta raíz del proyecto):
 
 ```bash
-pip install pandas pyserial pytest      # pyserial solo si se usa el Arduino o el simulador
+pip install -r requirements.txt          # para ejecutar: pandas y pyserial
+pip install -r requirements-dev.txt      # para ejecutar y además correr las pruebas (agrega pytest)
 ```
+
+| Paquete | Para qué | ¿Obligatorio? |
+|---|---|---|
+| `pandas` | Leer el CSV y armar los lotes | Sí |
+| `pyserial` | Puerto serie del Arduino y conexión al simulador | Solo para la pestaña Arduino y el simulador |
+| `pytest` | Pruebas automáticas | Solo para desarrollar |
+
+La instalación desde cero se validó en un entorno virtual nuevo: con `requirements-dev.txt`
+pasan las 116 pruebas (solo en Windows).
 
 | Para… | Comando |
 |---|---|
@@ -110,9 +121,8 @@ flowchart TD
     A["1. Elegir CSV"] --> B["Lectura en hilo aparte<br/>pandas + detección de separador , o ;"]
     B --> C["2. Informe de calidad<br/>filas, vacíos, duplicados"]
     C --> D["3. Elegir columnas<br/>casillas + vista previa de 50 filas"]
-    D --> E["4. Enviar al servidor<br/>lote de 1.000, 5.000 o 20.000"]
-    E --> F["JSON por lotes + EOF"]
-    F --> G["ACK del servidor<br/>filas confirmadas y demora"]
+    D --> E["4. Enviar al servidor<br/>JSON por lotes de 1.000, 5.000 o 20.000 + EOF"]
+    E --> G["ACK del servidor<br/>filas confirmadas y demora"]
 ```
 
 - **Carga:** `Dataset.cargar` detecta el separador (`,` o `;`), rechaza archivos con filas
@@ -133,14 +143,13 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A["Conectar Arduino<br/>puerto COM o simulador"] --> B["Gráficos en vivo<br/>temperatura, humedad, gas"]
-    B --> C["Iniciar transmisión<br/>frecuencia: 1 s, 2 s o 3 s"]
-    C --> D["Se guarda una fila por tic<br/>con fecha y hora"]
+    A["Conectar Arduino o simulador"] --> B["Gráficos en vivo"]
+    B --> C["Iniciar transmisión"]
+    C --> D["Guarda una fila por tic"]
     D --> E["Detener transmisión"]
-    E --> F["Trazabilidad:<br/>inicio, cierre, duración"]
-    E --> G["Envío al servidor<br/>una sola conexión"]
-    F --> H["Exportar CSV o JSON"]
-    G --> H
+    E --> F["Cierra la trazabilidad"]
+    F --> G["Envía al servidor"]
+    G --> H["Exportar CSV o JSON"]
 ```
 
 - **Conexión:** lista de puertos serie detectados, más la opción del simulador al final.
@@ -169,14 +178,19 @@ cierra mientras transmite, lo capturado se pierde.
 
 ```mermaid
 flowchart TD
-    V["VentanaCliente<br/>pantalla y eventos"] --> D["Dataset<br/>cargar, revisar, elegir columnas"]
-    V --> E["EmisorTCP<br/>envío por lotes y ACK"]
-    V --> G["GraficoLinea<br/>minigráficos con Canvas"]
-    V --> X["Espejo<br/>mismo progreso en ambas pestañas"]
-    V --> L["LectorSerial<br/>hilo lector del puerto"]
-    V --> R["Grabadora<br/>filas, inicio, cierre"]
+    V["VentanaCliente<br/>pantalla y eventos"] --> A["Pestaña Archivo CSV"]
+    V --> B["Pestaña Sensor Arduino"]
+    A --> D["Dataset<br/>cargar, revisar, elegir columnas"]
+    B --> L["LectorSerial<br/>hilo lector del puerto"]
+    D --> E["EmisorTCP<br/>envío por lotes y ACK"]
     L --> P["parsear_linea<br/>validación de rangos"]
+    P --> R["Grabadora<br/>filas, inicio, cierre"]
+    R --> E
 ```
+
+Dos carriles que convergen en `EmisorTCP`: el mismo código de red envía el CSV y la
+transmisión del Arduino. `GraficoLinea` (gráficos) y `Espejo` (progreso compartido) son
+ayudantes de la ventana, descritos en la tabla.
 
 | Clase / función | Archivo | Qué hace |
 |---|---|---|
@@ -200,14 +214,8 @@ cada 100 ms. Por eso la pantalla no se congela con archivos grandes.
 
 ```mermaid
 flowchart TD
-    subgraph P["Hilo principal: ventana"]
-        W["Widgets y gráficos"]
-        Q["Cola de tareas, cada 100 ms"]
-    end
-    H1["Hilo de carga del CSV"] -->|"cola"| Q
-    H2["Hilo de envío TCP"] -->|"cola"| Q
-    H3["Hilo lector serie"] -->|"cola"| Q
-    Q --> W
+    H["Hilos de trabajo<br/>carga del CSV, envío TCP, lectura serie"] -->|"dejan tareas"| Q["Cola de tareas<br/>se revisa cada 100 ms"]
+    Q -->|"las ejecuta"| W["Hilo principal: ventana<br/>widgets y gráficos"]
 ```
 
 ### 4.5 Errores contemplados

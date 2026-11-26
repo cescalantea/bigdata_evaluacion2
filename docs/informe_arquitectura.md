@@ -4,6 +4,8 @@
 > **Alcance:** la parte **cliente**. El servidor (Grupo 4) aparece solo como contexto, más un mini servidor de prueba nuestro.
 > **Estado:** borrador vivo, se actualiza a medida que se toman decisiones.
 >
+> **Vista completa y actual:** este informe describe el cliente de **CSV**. Para la aplicación entera (incluido el sensor Arduino, el simulador, la instalación y las pruebas) ver [`MAESTRO.md`](../MAESTRO.md).
+>
 > **Para ver bien los diagramas (Mermaid):** se recomienda abrir este documento con MarkText, que los muestra sin configuración extra. Descarga: https://github.com/marktext/marktext#download-and-installation
 
 ---
@@ -171,11 +173,16 @@ El archivo completo viaja como ~**119 MB** de texto (el JSON repite los nombres 
 
 ```text
 bigdata_evaluacion2/
-├── cliente.py            # TODO el cliente: lógica + GUI
-├── servidor_prueba.py    # mini servidor con botón Iniciar/Detener escucha, SOLO para comprobar que los datos llegan
-├── tests/test_cliente.py # 30 pruebas automáticas
-├── docs/informe_arquitectura.md
-└── (tu CSV)              # no se sube a git
+├── cliente.py             # el cliente: CSV, envío TCP y pestaña Arduino (lógica + GUI)
+├── sensor_arduino.py      # lógica del sensor sin GUI: puerto serie, validación, grabación, exportación
+├── simulador_arduino.py   # simulador de Arduino (ventana aparte, solo pruebas)
+├── servidor_prueba.py     # servidor del Grupo 4 con dashboard, para comprobar que los datos llegan
+├── requirements.txt       # dependencias para ejecutar (pandas, pyserial)
+├── requirements-dev.txt   # + pytest, para las pruebas
+├── tests/                 # 116 pruebas: test_cliente, test_servidor, test_sensor, test_simulador
+├── docs/                  # informes y documentación detallada
+├── MAESTRO.md             # documento maestro de la aplicación
+└── (tu CSV)               # no se sube a git
 ```
 
 **Por qué plana y sin MVC:** son pocas responsabilidades y un solo archivo se lee de arriba hacia abajo. Se separa por **clases**, no por carpetas. Si el proyecto creciera, cada clase puede pasar a su propio archivo sin cambiar su código.
@@ -313,7 +320,7 @@ Aplica aunque sea un trabajo de ramo.
 
 `servidor_prueba.py` se escribió **sin importar `cliente.py`**, como lo haría otro grupo. Si los dos programas se entienden, el contrato está bien definido.
 
-| Qué | Pruebas (30 en total, todas pasan) |
+| Qué | Pruebas del cliente CSV (`tests/test_cliente.py`; hoy son 45 y, con servidor, sensor y simulador, 116 en total) |
 |---|---|
 | Carga e informe | Cualquier CSV conserva sus columnas; conteo de vacíos y filas repetidas; archivos vacíos, sin filas o con columnas repetidas; archivo inexistente |
 | Informe | Conteo de vacíos y de filas repetidas |
@@ -338,11 +345,14 @@ Los dos programas se ejecutan **desde la carpeta raíz del proyecto** (la que co
 - En el Explorador de archivos, entrar a la carpeta del proyecto, escribir `cmd` o `powershell` en la barra de direcciones y pulsar Enter.
 - O abrir CMD o PowerShell y escribir `cd` con la ruta del proyecto, por ejemplo: `cd C:\lab\bigdata_evaluacion2`.
 
-**2. Instalar lo necesario (una sola vez)**, en el Python del equipo. `pytest` solo hace falta para correr las pruebas:
+**2. Instalar lo necesario (una sola vez)**, en el Python del equipo (3.10 o superior):
 
 ```powershell
-pip install pandas pytest
+pip install -r requirements.txt          # para ejecutar: pandas y pyserial
+pip install -r requirements-dev.txt      # para ejecutar y correr las pruebas (agrega pytest)
 ```
+
+`pyserial` solo se usa en la pestaña Arduino y en el simulador; el cliente de CSV funciona sin él.
 
 **3. Ejecutar cada programa en su propia ventana o pestaña**, ambas abiertas en la carpeta raíz:
 
@@ -350,6 +360,7 @@ pip install pandas pytest
 |---|---|---|
 | 1 · Servidor de prueba | `python servidor_prueba.py` | Se abre su ventana: pulsar **Iniciar escucha** |
 | 2 · Cliente | `python cliente.py` | Elegir el CSV, marcar las columnas y pulsar **Enviar datos** |
+| 3 · Simulador de Arduino (opcional) | `python simulador_arduino.py` | Pulsar **Encender Arduino**; en el cliente, pestaña **Sensor Arduino**, elegir `socket://127.0.0.1:5577` |
 
 > **Orden:** primero el servidor (con la escucha iniciada) y después el cliente. Cada comando abre una ventana gráfica y deja la terminal ocupada mientras el programa esté abierto; por eso se necesita **una terminal por programa**. Para cerrar un programa, se cierra su ventana.
 
