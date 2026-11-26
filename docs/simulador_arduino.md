@@ -10,6 +10,8 @@ enviaría el script `scrip_arduino_sensor_v3.txt`: `temperatura,humedad,gas`, un
 
 ## Cómo usarlo
 
+Requiere `pyserial`: `pip install -r requirements.txt`.
+
 1. Abrir el simulador: `python simulador_arduino.py` y pulsar **Encender Arduino**.
 2. Abrir la aplicación: `python cliente.py` → pestaña **Sensor Arduino**.
 3. En la lista de puertos elegir `socket://127.0.0.1:5577` (aparece siempre al final) y
