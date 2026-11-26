@@ -1,0 +1,78 @@
+// Arduino Uno + DHT11 (temperatura/humedad) + MQ-2 (gas)   -   versión 2
+//
+// Salida por serie (9600 baudios), una línea CSV: Temperatura,Humedad,Gas
+//   ejemplo: 24.5,60.0,312        (o ERROR_LECTURA si el DHT11 falla)
+//
+// Conexiones:
+//   DHT11  -> datos al pin digital 2 (alimentar con 5 V y GND)
+//   MQ-2   -> salida analógica AO al pin A0 (alimentar con 5 V y GND)
+//
+// Cambios respecto de la v1:
+//   - Gas real con analogRead(A0): 0 a 1023 (valor relativo, no son ppm calibradas).
+//   - Sin delay(): se usa millis(), así se envía cada 200 ms (hasta 5 datos/s).
+//   - El DHT11 no mide más rápido que ~1 vez por segundo: se lee cada 1 s y entre lecturas
+//     se repite el último valor. El gas sí cambia en cada envío.
+//   - Si el DHT11 falla se envía ERROR_LECTURA (la aplicación lo ignora).
+//   - Se eliminaron las marcas "[cite: ...]" que quedaron pegadas en los comentarios de la v1.
+//
+// Nota MQ-2: necesita ~20 s de precalentamiento al encender; al inicio los valores son
+// inestables. Ignorar ese tramo al interpretar los datos.
+
+#include <DHT.h>
+
+#define DHTPIN 2          // Pin digital 2: cable de datos del DHT11
+#define DHTTYPE DHT11     // Sensor azul DHT11
+#define GASPIN A0         // Salida analógica del MQ-2
+
+const unsigned long PERIODO_ENVIO_MS = 200;    // 5 líneas por segundo
+const unsigned long PERIODO_DHT_MS = 1000;     // el DHT11 no admite más de 1 lectura/s
+
+DHT dht(DHTPIN, DHTTYPE);
+
+float temp = 0;
+float hum = 0;
+bool dhtOk = false;                 // false si la última lectura del DHT11 falló
+unsigned long ultimoEnvio = 0;
+unsigned long ultimoDHT = 0;
+
+// Lee el DHT11 y guarda el resultado (o marca el error).
+void leerDHT() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  dhtOk = !(isnan(t) || isnan(h));
+  if (dhtOk) {
+    temp = t;
+    hum = h;
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  delay(1000);                      // el DHT11 necesita ~1 s tras encender
+  leerDHT();
+  ultimoDHT = millis();
+}
+
+void loop() {
+  unsigned long ahora = millis();
+
+  if (ahora - ultimoDHT >= PERIODO_DHT_MS) {
+    ultimoDHT = ahora;
+    leerDHT();
+  }
+
+  if (ahora - ultimoEnvio >= PERIODO_ENVIO_MS) {
+    ultimoEnvio = ahora;
+    if (!dhtOk) {
+      Serial.println("ERROR_LECTURA");
+    } else {
+      int gas = analogRead(GASPIN);   // 0 a 1023
+      Serial.print(temp, 1);
+      Serial.print(",");
+      Serial.print(hum, 1);
+      Serial.print(",");
+      Serial.println(gas);
+    }
+  }
+}

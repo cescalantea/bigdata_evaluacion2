@@ -1,0 +1,32 @@
+#include <DHT.h>
+
+#define DHTPIN 2       // Pin digital 2 donde va el cable de señal (out) del DHT11
+#define DHTTYPE DHT11  // Sensor azul DHT11
+#define GASPIN A0      // Pin analógico A0 donde va el AO del sensor de gas
+
+DHT dht(DHTPIN, DHTTYPE);
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  delay(2000); // Tiempo de estabilización inicial
+}
+
+void loop() {
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+  int gas = analogRead(GASPIN); // Lectura analógica del gas (0 - 1023)
+
+  if (isnan(temp) || isnan(hum)) {
+    Serial.println("ERROR_LECTURA");
+  } else {
+    // Envía formato CSV limpio: Temperatura, Humedad, Gas
+    Serial.print(temp, 1);
+    Serial.print(",");
+    Serial.print(hum, 1);
+    Serial.print(",");
+    Serial.println(gas);
+  }
+
+  delay(2000); // Envía datos cada 2 segundos
+}

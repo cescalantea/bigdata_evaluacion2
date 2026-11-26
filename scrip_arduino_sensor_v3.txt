@@ -1,0 +1,57 @@
+// Arduino Uno + DHT11 (temperatura/humedad) + MQ-2 (gas)   -   versión 3
+//
+// Salida por serie (9600 baudios), una línea CSV por segundo: Temperatura,Humedad,Gas
+//   ejemplo: 24.5,60.0,312        (o ERROR_LECTURA si el DHT11 falla)
+//
+// Conexiones:
+//   DHT11  -> datos al pin digital 2 (alimentar con 5 V y GND)
+//   MQ-2   -> salida analógica AO al pin A0 (alimentar con 5 V y GND)
+//
+// Cambios respecto de la v2:
+//   - Se envía 1 línea por segundo, que es el máximo del DHT11 (1 Hz). Así cada línea
+//     trae una medición NUEVA de temperatura y humedad; ya no se repiten valores.
+//   - La aplicación elige cada cuánto guarda un dato: 1 por segundo, 1 cada 2 s o 1 cada 3 s.
+//   - Sigue sin usar delay() en el bucle: el período se controla con millis().
+//
+// Nota MQ-2: necesita ~20 s de precalentamiento al encender; al inicio los valores son
+// inestables. Ignorar ese tramo al interpretar los datos.
+
+#include <DHT.h>
+
+#define DHTPIN 2          // Pin digital 2: cable de datos del DHT11
+#define DHTTYPE DHT11     // Sensor azul DHT11
+#define GASPIN A0         // Salida analógica del MQ-2
+
+const unsigned long PERIODO_MS = 1000;   // 1 medición y 1 envío por segundo (límite del DHT11)
+
+DHT dht(DHTPIN, DHTTYPE);
+
+unsigned long ultimoEnvio = 0;
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+  delay(1000);                      // el DHT11 necesita ~1 s tras encender
+}
+
+void loop() {
+  unsigned long ahora = millis();
+  if (ahora - ultimoEnvio < PERIODO_MS) {
+    return;                         // todavía no toca medir
+  }
+  ultimoEnvio = ahora;
+
+  float temp = dht.readTemperature();
+  float hum = dht.readHumidity();
+  int gas = analogRead(GASPIN);     // 0 a 1023, valor relativo (no son ppm)
+
+  if (isnan(temp) || isnan(hum)) {
+    Serial.println("ERROR_LECTURA");
+  } else {
+    Serial.print(temp, 1);
+    Serial.print(",");
+    Serial.print(hum, 1);
+    Serial.print(",");
+    Serial.println(gas);
+  }
+}
