@@ -342,7 +342,7 @@ class MongoRepositorio:
         self.uri = os.environ.get("MONGODB_URI", "").strip()
         self.nombre_bd = os.environ.get("MONGODB_DB", "bigdata_eval3").strip()
         self.coleccion_csv = os.environ.get("MONGODB_COLLECTION_CSV", "datos_csv").strip()
-        self.tamano_lote = int(os.environ.get("MONGODB_BATCH_SIZE", "20000"))
+        self.tamano_lote = int(os.environ.get("MONGODB_BATCH_SIZE", "270000"))
         self.timeout_ms = int(os.environ.get("MONGODB_TIMEOUT_MS", "15000"))
         self.max_intentos = int(os.environ.get("MONGODB_MAX_ATTEMPTS", "3"))
         self.delay_reintento = float(os.environ.get("MONGODB_RETRY_DELAY", "2"))
