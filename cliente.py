@@ -10,14 +10,18 @@ Autores:
 
 Licencia: solo educacional.
 
-Flujo:
+Flujo (pestaña "Archivo CSV"):
 1. Cargar un CSV.  
 2. Revisión del archivo.
 3. Elegir columnas a enviar. 
 4. Enviar al servidor.
 
-Requisitos: Python 3.10+ con pandas instalado (pip install pandas).
-Sensor Arduino (opcional, paso 5): pip install pyserial  (ver sensor_arduino.py).
+Pestaña "Sensor Arduino": conectar el Arduino (o el simulador), ver los gráficos, iniciar y
+detener la transmisión (se envía al servidor al detener) y exportar lo capturado.
+
+Requisitos: Python 3.10+ y las dependencias de requirements.txt:
+    pip install -r requirements.txt     (pandas y pyserial; pyserial solo para el Arduino)
+Visión completa de la aplicación: MAESTRO.md.
 
 Ejecutar:  python cliente.py
 """

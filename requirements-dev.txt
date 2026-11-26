@@ -1,0 +1,5 @@
+# Dependencias para desarrollar y correr las pruebas.
+# Instalar con:  pip install -r requirements-dev.txt
+
+-r requirements.txt
+pytest>=8.0        # pruebas automáticas:  python -m pytest -q
