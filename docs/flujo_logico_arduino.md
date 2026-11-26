@@ -19,7 +19,7 @@ flowchart TD
     B -->|"parsear_linea valida rango"| C{"¿Línea válida?"}
     C -->|No| D["Se descarta<br/>ERROR_LECTURA, ruido"]
     C -->|Sí| E["Última lectura<br/>vigente 6 s"]
-    E -->|"cola de tareas"| F["GUI: 3 gráficos de línea<br/>temperatura, humedad, gas"]
+    E -->|"cola de tareas"| F["GUI: 3 ecualizadores con semáforo<br/>temperatura, humedad, gas"]
     E -->|"cada 1, 2 o 3 s"| G["Grabadora<br/>filas en memoria"]
     G -->|"Detener transmisión"| H["EmisorTCP<br/>JSON por lotes + EOF"]
     I["Pestaña CSV<br/>Dataset + selección de columnas"] -->|"Enviar datos"| H
@@ -252,7 +252,7 @@ flowchart TD
 | Archivo | Rol |
 |---|---|
 | `sensor_arduino.py` | Lógica del sensor sin GUI: parseo, lector serie, grabadora, tasas |
-| `cliente.py` | Ventana con pestañas, gráficos (`GraficoLinea`) y `EmisorTCP` |
+| `cliente.py` | Ventana con pestañas, gráficos de barras (`GraficoBarras`) y `EmisorTCP` |
 | `scrip_arduino_sensor_v3.txt` | Código para el Arduino: 1 línea por segundo (límite del DHT11) |
 | `tests/test_sensor.py` | 22 pruebas con un puerto serie simulado, sin hardware |
 

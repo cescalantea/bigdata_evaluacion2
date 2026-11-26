@@ -67,7 +67,7 @@ con el otro grupo.**
 | `servidor_prueba.py` | Servidor con dashboard | Grupo 4 |
 | `scrip_arduino_sensor_v3.txt` | Código para la placa (1 línea por segundo) | Grupo 3 |
 | `requirements.txt`, `requirements-dev.txt` | Dependencias para ejecutar y para desarrollar | Grupo 3 |
-| `tests/` | Pruebas automáticas (116) | ambos |
+| `tests/` | Pruebas automáticas (146) | ambos |
 | `docs/` | Informes y documentación detallada | ambos |
 
 ---
@@ -91,7 +91,7 @@ pip install -r requirements-dev.txt      # para ejecutar y además correr las pr
 | `pytest` | Pruebas automáticas | Solo para desarrollar |
 
 La instalación desde cero se validó en un entorno virtual nuevo: con `requirements-dev.txt`
-pasan las 116 pruebas (solo en Windows).
+pasan las 146 pruebas (solo en Windows).
 
 | Para… | Comando |
 |---|---|
@@ -154,8 +154,9 @@ flowchart TD
 
 - **Conexión:** lista de puertos serie detectados, más la opción del simulador al final.
   Los gráficos aparecen solo al conectar.
-- **Gráficos:** uno por magnitud, cada uno con su propia escala (nunca doble eje). Muestran
-  valor actual, mín/máx, guías con escala y relleno suave.
+- **Gráficos tipo ecualizador:** una sola barra de segmentos por magnitud, que sube o baja con
+  cada lectura con un movimiento suave. Muestran valor actual, mín/máx, estado y líneas en los
+  límites del sensor. Ver el semáforo en la sección 4.2.1.
 - **Frecuencias:** 1 dato por segundo, 1 cada 2 s y 1 cada 3 s. El DHT11 entrega **como máximo
   1 dato por segundo**, por eso no se ofrecen frecuencias más rápidas.
 - **Iniciar / Detener transmisión:** al iniciar se valida la red *antes* de capturar. Al
@@ -174,6 +175,28 @@ conexión, corta cada conexión a los 600 s y solo muestra los datos al recibir 
 detener evita las tres limitaciones sin cambiar el contrato. El costo: si la aplicación se
 cierra mientras transmite, lo capturado se pierde.
 
+#### 4.2.1 Semáforo de niveles
+
+Cada segmento de la barra lleva el color de la zona que representa, y los segmentos apagados
+muestran el tono suave de su zona, así la escala de colores se ve siempre. El color nunca va
+solo: junto al valor aparece un símbolo y una palabra (● Normal, ▲ Precaución, ✖ Alerta).
+
+| Magnitud | Verde (normal) | Amarillo (precaución) | Rojo (alerta) | Origen de los límites |
+|---|---|---|---|---|
+| Temperatura | 5 a 45 °C | 0 a 5 °C y 45 a 50 °C | menos de 0 °C o más de 50 °C | Límites del DHT11 (0 a 50 °C) |
+| Humedad | 27 a 83 % | 20 a 27 % y 83 a 90 % | menos de 20 % o más de 90 % | Límites del DHT11 (20 a 90 % HR) |
+| Gas (MQ-2) | menos de 300 | 300 a 599 | 600 o más | Umbrales de referencia, **sin calibrar** |
+
+- **Temperatura y humedad:** el rojo es "fuera de los límites de operación y medición del
+  DHT11" (la lectura ya no es confiable). El amarillo es el 10 % del rango más cercano a cada
+  límite. La barra muestra los límites más un 10 % a cada lado, para que la zona roja tenga
+  espacio.
+- **Gas:** el MQ-2 entrega un valor analógico relativo (0 a 1023), no ppm. Los umbrales 300 y
+  600 son de referencia para la demostración; hay que calibrarlos con la placa real antes de
+  darles un significado de seguridad. Están en `sensor_arduino.py` (`GAS_PRECAUCION` y
+  `GAS_PELIGRO`).
+- El semáforo **solo se muestra**: no filtra ni modifica los datos que se capturan y se envían.
+
 ### 4.3 Arquitectura del código
 
 ```mermaid
@@ -189,7 +212,7 @@ flowchart TD
 ```
 
 Dos carriles que convergen en `EmisorTCP`: el mismo código de red envía el CSV y la
-transmisión del Arduino. `GraficoLinea` (gráficos) y `Espejo` (progreso compartido) son
+transmisión del Arduino. `GraficoBarras` (ecualizador) y `Espejo` (progreso compartido) son
 ayudantes de la ventana, descritos en la tabla.
 
 | Clase / función | Archivo | Qué hace |
@@ -197,7 +220,8 @@ ayudantes de la ventana, descritos en la tabla.
 | `VentanaCliente` | `cliente.py` | La ventana. No sabe leer CSV ni usar sockets: delega y solo muestra |
 | `Dataset` | `cliente.py` | Carga, informe y selección de columnas. Sirve para cualquier CSV |
 | `EmisorTCP` | `cliente.py` | Envío por lotes con cancelación y lectura del ACK |
-| `GraficoLinea` | `cliente.py` | Minigráfico de líneas dibujado con `tk.Canvas` (sin librerías extra) |
+| `GraficoBarras` | `cliente.py` | Ecualizador de una barra con semáforo, dibujado con `tk.Canvas` (sin librerías extra) |
+| `nivel`, `escala` | `sensor_arduino.py` | Semáforo de un valor y rango visible de la barra |
 | `Espejo` | `cliente.py` | Repite `configure()` en varios widgets (barra y estado en las dos pestañas) |
 | `LectorSerial` | `sensor_arduino.py` | Hilo que lee el puerto, valida y guarda la última lectura |
 | `Grabadora` | `sensor_arduino.py` | Acumula filas y registra inicio, cierre y duración |
@@ -253,13 +277,13 @@ Aplica aunque sea un trabajo de ramo.
 
 ### 4.7 Pruebas
 
-116 pruebas automáticas (`python -m pytest -q`):
+146 pruebas automáticas (`python -m pytest -q`):
 
 | Archivo | Pruebas | Cubre |
 |---|---|---|
 | `tests/test_cliente.py` | 45 | Carga de CSV, columnas, envío, cancelación, errores de red |
 | `tests/test_servidor.py` | 32 | Recepción, validación, filtros, carga masiva |
-| `tests/test_sensor.py` | 24 | Validación de líneas, lector serie, grabadora, trazabilidad, exportación |
+| `tests/test_sensor.py` | 54 | Validación de líneas, lector serie, grabadora, trazabilidad, exportación, semáforo y ecualizador |
 | `tests/test_simulador.py` | 15 | Generador de datos, exportación, conexión real por `socket://`, recorrido completo |
 
 ---
@@ -321,7 +345,7 @@ documentación definitiva del servidor la elaborará el Grupo 4.
 
 ## 8. Estado, límites y pendientes
 
-**Validado:** funcionamiento en **Windows** (decisión del proyecto: no se valida en Linux), 116
+**Validado:** funcionamiento en **Windows** (decisión del proyecto: no se valida en Linux), 146
 pruebas automáticas y recorrido completo simulador → cliente → servidor.
 
 **Pendiente:**
