@@ -316,75 +316,126 @@ class Espejo:
         return self._widgets[0].cget(opcion)
 
 
-class GraficoLinea(tk.Canvas):
+# Colores del semáforo. Nunca van solos: cada nivel lleva también un símbolo y una palabra.
+COLORES_NIVEL = {sensor_arduino.VERDE: "#16A34A", sensor_arduino.AMARILLO: "#D97706",
+                 sensor_arduino.ROJO: "#DC2626"}
+SIMBOLOS_NIVEL = {sensor_arduino.VERDE: "●", sensor_arduino.AMARILLO: "▲", sensor_arduino.ROJO: "✖"}
+PALABRAS_NIVEL = {sensor_arduino.VERDE: "Normal", sensor_arduino.AMARILLO: "Precaución",
+                  sensor_arduino.ROJO: "Alerta"}
+
+
+class GraficoBarras(tk.Canvas):
     """
-    Minigráfico de líneas de UNA magnitud (cada sensor con su propia escala: nunca doble eje).
-    Guarda los últimos 'maximo' puntos y se redibuja al recibir uno o al cambiar de tamaño.
+    Ecualizador de UNA magnitud: una sola barra de segmentos que sube y baja con cada lectura, con
+    un movimiento suave. Los segmentos llevan el color del semáforo de sensor_arduino.nivel(); los
+    apagados muestran el tono suave de su zona, así la escala de colores se ve siempre.
+    Guarda las últimas HISTORIAL lecturas solo para calcular el mínimo y el máximo.
     """
 
-    def __init__(self, padre, titulo, unidad, color, span_minimo, decimales=1, maximo=150, alto=108):
+    SEGMENTOS = 16
+    HISTORIAL = 150
+    ANCHO_MAXIMO_BARRA = 120       # píxeles
+    PASO_ANIMACION_MS = 35
+
+    def __init__(self, padre, campo, titulo, unidad, decimales=1, alto=170):
         super().__init__(padre, bg=TARJETA, height=alto, highlightthickness=1,
                          highlightbackground="#E3E8ED")
-        self.titulo, self.unidad, self.color = titulo, unidad, color
-        self.span_minimo, self.decimales = span_minimo, decimales
-        self.puntos = collections.deque(maxlen=maximo)
+        self.campo, self.titulo, self.unidad, self.decimales = campo, titulo, unidad, decimales
+        self.escala_min, self.escala_max = sensor_arduino.escala(campo)
+        self.puntos = collections.deque(maxlen=self.HISTORIAL)
+        self._nivel_mostrado = 0.0     # segmentos encendidos en pantalla (con decimales mientras se mueve)
+        self._id_animacion = None
+        # Color de cada segmento según el valor que representa (de abajo hacia arriba).
+        paso = (self.escala_max - self.escala_min) / self.SEGMENTOS
+        self.niveles_segmento = [sensor_arduino.nivel(campo, self.escala_min + (i + 0.5) * paso)
+                                 for i in range(self.SEGMENTOS)]
         self.bind("<Configure>", lambda e: self._dibujar())
+        self.bind("<Destroy>", lambda e: self._cancelar_animacion())
 
-    # Propósito: añadir un valor y redibujar.
+    # Propósito: registrar una lectura nueva; la barra se mueve suavemente hacia su nivel.
     def agregar(self, valor):
         self.puntos.append(valor)
+        self._cancelar_animacion()
+        self._animar()
+
+    # Propósito: vaciar el gráfico (al desconectar). La barra vuelve a cero.
+    def limpiar(self):
+        self._cancelar_animacion()
+        self.puntos.clear()
+        self._nivel_mostrado = 0.0
         self._dibujar()
 
-    # Propósito: borrar la serie (al desconectar).
-    def limpiar(self):
-        self.puntos.clear()
+    def _cancelar_animacion(self):
+        if self._id_animacion is not None:
+            try:
+                self.after_cancel(self._id_animacion)
+            except tk.TclError:           # la ventana ya se está cerrando
+                pass
+            self._id_animacion = None
+
+    # Propósito: acercar la barra a su nivel por pasos (sube o baja), y redibujar en cada paso.
+    def _animar(self):
+        self._id_animacion = None
+        diferencia = self._encendidos(self.puntos[-1]) - self._nivel_mostrado
+        paso = max(abs(diferencia) * 0.35, 0.4)
+        if abs(diferencia) <= paso:
+            self._nivel_mostrado += diferencia
+        else:
+            self._nivel_mostrado += paso if diferencia > 0 else -paso
+            self._id_animacion = self.after(self.PASO_ANIMACION_MS, self._animar)
         self._dibujar()
+
+    # Propósito: cuántos segmentos se encienden para un valor (mínimo 1, para que la barra se vea).
+    def _encendidos(self, valor):
+        fraccion = (valor - self.escala_min) / (self.escala_max - self.escala_min)
+        return min(max(math.ceil(fraccion * self.SEGMENTOS), 1), self.SEGMENTOS)
 
     # Propósito: número con coma decimal y los decimales propios de esta magnitud.
     def _formato(self, valor):
         return f"{valor:.{self.decimales}f}".replace(".", ",")
 
-    # Propósito: encabezado (nombre, mín/máx, valor actual) y debajo la línea con relleno suave,
-    # guías horizontales con su escala y un punto resaltado en el último dato.
+    # Propósito: encabezado (nombre, mín/máx, valor y estado) y debajo la barra del ecualizador, con
+    # líneas en los límites del sensor (o en los umbrales, para el gas). Sin bordes en los segmentos.
     def _dibujar(self):
         self.delete("all")
         ancho, alto = self.winfo_width(), self.winfo_height()
         self.create_text(14, 14, anchor="w", text=self.titulo, fill=TEXTO, font=(FUENTE, 10, "bold"))
-        if not self.puntos or ancho < 120:
+        if not self.puntos or ancho < 160:
             self.create_text(ancho / 2, alto / 2 + 8, text="Esperando datos…", fill=SUAVE,
                              font=(FUENTE, 9))
             return
         actual = self.puntos[-1]
-        texto = f"{self._formato(actual)} {self.unidad}".strip()
-        self.create_text(ancho - 14, 15, anchor="e", fill=TEXTO, font=(FUENTE, 16, "bold"), text=texto)
-        self.create_text(14, 31, anchor="w", fill=SUAVE, font=(FUENTE, 8),
+        nivel = sensor_arduino.nivel(self.campo, actual)
+        self.create_text(ancho - 14, 15, anchor="e", fill=TEXTO, font=(FUENTE, 16, "bold"),
+                         text=f"{self._formato(actual)} {self.unidad}".strip())
+        self.create_text(14, 33, anchor="w", fill=SUAVE, font=(FUENTE, 8),
                          text=f"mín {self._formato(min(self.puntos))} · máx {self._formato(max(self.puntos))}")
+        palabra = self.create_text(ancho - 14, 33, anchor="e", fill=TEXTO, font=(FUENTE, 9, "bold"),
+                                   text=PALABRAS_NIVEL[nivel])
+        self.create_text(self.bbox(palabra)[0] - 4, 33, anchor="e", fill=COLORES_NIVEL[nivel],
+                         font=(FUENTE, 9), text=SIMBOLOS_NIVEL[nivel])
 
-        izq, der, arriba, abajo = 46, ancho - 16, 52, alto - 16
-        bajo, alto_val = min(self.puntos), max(self.puntos)
-        centro = (bajo + alto_val) / 2
-        mitad = max(alto_val - bajo, self.span_minimo) / 2
-        bajo, alto_val = centro - mitad, centro + mitad
-        # Guías: tres niveles con su valor a la izquierda (sin cuadrícula pesada).
-        for fraccion in (0, 0.5, 1):
-            y = abajo - fraccion * (abajo - arriba)
-            self.create_line(izq, y, der, y, fill="#E3E8ED", dash=(2, 4) if fraccion else ())
-            self.create_text(izq - 8, y, anchor="e", fill=SUAVE, font=(FUENTE, 8),
-                             text=self._formato(bajo + fraccion * (alto_val - bajo)))
+        izq, der, arriba, abajo = 46, ancho - 16, 56, alto - 12
+        alto_segmento = (abajo - arriba) / self.SEGMENTOS
 
-        n = len(self.puntos)
-        paso = (der - izq) / max(self.puntos.maxlen - 1, 1)
-        x0 = der - (n - 1) * paso                                      # el último punto queda a la derecha
-        coords = []
-        for i, valor in enumerate(self.puntos):
-            coords += [x0 + i * paso, abajo - (valor - bajo) / (alto_val - bajo) * (abajo - arriba)]
-        if n > 1:
-            self.create_polygon(*coords, coords[-2], abajo, coords[0], abajo,
-                                fill=aclarar(self.color, 0.86), outline="")
-            self.create_line(*coords, fill=self.color, width=2, joinstyle="round", capstyle="round")
-        x, y = coords[-2], coords[-1]
-        self.create_oval(x - 8, y - 8, x + 8, y + 8, fill=aclarar(self.color, 0.7), outline="")
-        self.create_oval(x - 4, y - 4, x + 4, y + 4, fill=self.color, outline=TARJETA, width=2)
+        # Líneas de referencia: límites del DHT11 (0 y 50 °C; 20 y 90 %) o umbrales del gas.
+        marcas = (sensor_arduino.GAS_PRECAUCION, sensor_arduino.GAS_PELIGRO) if self.campo == "gas" \
+            else sensor_arduino.LIMITES_SENSOR[self.campo]
+        for valor in marcas:
+            y = abajo - (valor - self.escala_min) / (self.escala_max - self.escala_min) * (abajo - arriba)
+            self.create_line(izq - 4, y, der, y, fill="#9AA5B1", dash=(2, 3))
+            self.create_text(izq - 8, y, anchor="e", fill=SUAVE, font=(FUENTE, 8), text=f"{valor:.0f}")
+
+        # La barra: centrada, con los segmentos de abajo hacia arriba.
+        ancho_barra = min(self.ANCHO_MAXIMO_BARRA, (der - izq) * 0.5)
+        x1 = (izq + der) / 2 - ancho_barra / 2
+        encendidos = round(self._nivel_mostrado)
+        for segmento in range(self.SEGMENTOS):
+            color = COLORES_NIVEL[self.niveles_segmento[segmento]]
+            y2 = abajo - segmento * alto_segmento - 1
+            self.create_rectangle(x1, y2 - alto_segmento + 2, x1 + ancho_barra, y2,
+                                  fill=color if segmento < encendidos else aclarar(color, 0.88),
+                                  outline="")
 
 
 class VentanaCliente(tk.Tk):
@@ -396,7 +447,7 @@ class VentanaCliente(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Cliente · Envío de datos por sockets")
-        self.geometry("1120x740")
+        self.geometry("1120x790")
         self.minsize(980, 640)
         self.configure(bg=FONDO)
 
@@ -793,13 +844,14 @@ class VentanaCliente(tk.Tk):
         graficos = ttk.Frame(self.panel_sensor, style="Tarjeta.TFrame")
         graficos.pack(fill="x", pady=(10, 0))
         self.graficos = {
-            "temperatura": GraficoLinea(graficos, "Temperatura", "°C", "#B45309", span_minimo=2, alto=170),
-            "humedad": GraficoLinea(graficos, "Humedad", "%", ACENTO, span_minimo=5, alto=170),
-            "gas": GraficoLinea(graficos, "Gas", "", "#6D28D9", span_minimo=50, decimales=0, alto=170),
+            "temperatura": GraficoBarras(graficos, "temperatura", "Temperatura", "°C"),
+            "humedad": GraficoBarras(graficos, "humedad", "Humedad", "%"),
+            "gas": GraficoBarras(graficos, "gas", "Gas", "", decimales=0),
         }
         for i, grafico in enumerate(self.graficos.values()):
             graficos.columnconfigure(i, weight=1, uniform="g")
             grafico.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0))
+        self._crear_leyenda_semaforo(self.panel_sensor)
 
         control = ttk.Frame(self.panel_sensor, style="Tarjeta.TFrame")
         control.pack(fill="x", pady=(10, 0))
@@ -836,6 +888,19 @@ class VentanaCliente(tk.Tk):
         self.etiqueta_exportado = ttk.Label(exportar, text="", style="Suave.TLabel")
         self.etiqueta_exportado.pack(side="left", padx=10)
         self.buscar_puertos()
+
+    # Propósito: leyenda del semáforo (símbolo + palabra) y de dónde salen los límites.
+    def _crear_leyenda_semaforo(self, padre):
+        fila = tk.Frame(padre, bg=TARJETA)
+        fila.pack(fill="x", pady=(6, 0))
+        for nivel in (sensor_arduino.VERDE, sensor_arduino.AMARILLO, sensor_arduino.ROJO):
+            tk.Label(fila, text=SIMBOLOS_NIVEL[nivel], bg=TARJETA, fg=COLORES_NIVEL[nivel],
+                     font=(FUENTE, 9)).pack(side="left")
+            tk.Label(fila, text=PALABRAS_NIVEL[nivel], bg=TARJETA, fg=TEXTO,
+                     font=(FUENTE, 9)).pack(side="left", padx=(2, 12))
+        tk.Label(fila, bg=TARJETA, fg=SUAVE, font=(FUENTE, 8),
+                 text="Temperatura 0–50 °C y humedad 20–90 %: límites del DHT11 (rojo = fuera de rango) · "
+                      "Gas: umbrales de referencia 300 y 600, sin calibrar").pack(side="left")
 
     # Propósito: datos de red y avance del envío de la pestaña Arduino.
     # Comparte IP y puerto con la pestaña CSV (mismas variables) y duplica barra, estado y cancelar

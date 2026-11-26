@@ -238,3 +238,91 @@ def test_exportaciones_tienen_solo_las_cuatro_columnas_enviadas(tmp_path):
     assert (tmp_path / "a.csv").read_text(encoding="utf-8").splitlines() == [
         "fecha_hora,temperatura,humedad,gas", "2026-11-23 15:00:00.123,23.0,55.0,134.0"]
     assert json.loads((tmp_path / "a.json").read_text(encoding="utf-8")) == filas
+
+
+# --- Semáforo y ecualizador -------------------------------------------------------------------
+
+@pytest.mark.parametrize("campo, valor, esperado", [
+    ("temperatura", -0.1, "rojo"), ("temperatura", 0, "amarillo"), ("temperatura", 4.9, "amarillo"),
+    ("temperatura", 5, "verde"), ("temperatura", 25, "verde"), ("temperatura", 45, "verde"),
+    ("temperatura", 45.1, "amarillo"), ("temperatura", 50, "amarillo"), ("temperatura", 50.1, "rojo"),
+    ("humedad", 19.9, "rojo"), ("humedad", 20, "amarillo"), ("humedad", 26.9, "amarillo"),
+    ("humedad", 27, "verde"), ("humedad", 55, "verde"), ("humedad", 83, "verde"),
+    ("humedad", 83.1, "amarillo"), ("humedad", 90, "amarillo"), ("humedad", 90.1, "rojo"),
+    ("gas", 0, "verde"), ("gas", 299, "verde"), ("gas", 300, "amarillo"),
+    ("gas", 599, "amarillo"), ("gas", 600, "rojo"), ("gas", 1023, "rojo"),
+])
+def test_semaforo_respeta_los_limites_del_dht11_y_los_umbrales_del_gas(campo, valor, esperado):
+    assert sensor_arduino.nivel(campo, valor) == esperado
+
+
+def test_escala_de_la_barra_deja_espacio_para_la_zona_roja():
+    assert sensor_arduino.escala("temperatura") == (-5.0, 55.0)     # 0-50 °C más 10 % por lado
+    assert sensor_arduino.escala("humedad") == (13.0, 97.0)         # 20-90 % más 10 % por lado
+    assert sensor_arduino.escala("gas") == (0.0, 1023.0)
+
+
+def test_ecualizador_colorea_los_segmentos_con_el_semaforo(ventana):
+    temperatura = ventana.graficos["temperatura"]
+    assert temperatura.niveles_segmento == (["rojo"] + ["amarillo"] * 2 + ["verde"] * 10
+                                            + ["amarillo"] * 2 + ["rojo"])
+    gas = ventana.graficos["gas"]
+    assert gas.niveles_segmento[0] == "verde" and gas.niveles_segmento[-1] == "rojo"
+
+
+def test_ecualizador_enciende_segmentos_segun_el_valor(ventana):
+    t = ventana.graficos["temperatura"]
+    assert t._encendidos(25) == 8                 # mitad de la escala
+    assert t._encendidos(-50) == 1                # siempre se ve al menos un segmento
+    assert t._encendidos(500) == t.SEGMENTOS      # fuera de la escala por arriba: barra completa
+
+
+# Propósito: dejar correr la animación de la barra hasta que llegue a su nivel (con tope de tiempo).
+def _terminar_animacion(ventana, grafico, tiempo=3.0):
+    limite = time.monotonic() + tiempo
+    while grafico._id_animacion is not None and time.monotonic() < limite:
+        ventana.update()
+        time.sleep(0.01)
+
+
+def test_ecualizador_dibuja_una_sola_barra_sin_bordes(ventana):
+    t = ventana.graficos["temperatura"]
+    t.winfo_width, t.winfo_height = (lambda: 400), (lambda: 170)    # ventana oculta: simula el tamaño
+    t.agregar(25)
+    _terminar_animacion(ventana, t)
+    rectangulos = [i for i in t.find_all() if t.type(i) == "rectangle"]
+    assert len(rectangulos) == t.SEGMENTOS                          # una barra: un rectángulo por segmento
+    assert all(t.itemcget(i, "outline") == "" for i in rectangulos)  # sin bordes negros
+    lit = [i for i in rectangulos if t.itemcget(i, "fill") in sensor_arduino_colores()]
+    assert len(lit) == 8                                            # 25 °C: mitad de la escala
+
+
+def sensor_arduino_colores():
+    from cliente import COLORES_NIVEL
+    return set(COLORES_NIVEL.values())
+
+
+def test_la_barra_sube_y_baja_hasta_el_nivel_de_cada_lectura(ventana):
+    t = ventana.graficos["temperatura"]
+    t.winfo_width, t.winfo_height = (lambda: 400), (lambda: 170)
+    t.agregar(25)
+    _terminar_animacion(ventana, t)
+    assert t._nivel_mostrado == 8
+    t.agregar(45)                                   # sube
+    ventana.update()
+    assert 8 <= t._nivel_mostrado < t._encendidos(45)    # va en camino, todavía no llega
+    _terminar_animacion(ventana, t)
+    assert t._nivel_mostrado == t._encendidos(45) == 14
+    t.agregar(5)                                    # baja
+    _terminar_animacion(ventana, t)
+    assert t._nivel_mostrado == t._encendidos(5) == 3
+
+
+def test_ecualizador_guarda_historial_acotado_y_limpiar_vuelve_a_cero(ventana):
+    t = ventana.graficos["humedad"]
+    t.winfo_width, t.winfo_height = (lambda: 400), (lambda: 170)
+    for i in range(t.HISTORIAL + 20):
+        t.agregar(50 + i * 0.01)
+    assert len(t.puntos) == t.HISTORIAL
+    t.limpiar()
+    assert not t.puntos and t._nivel_mostrado == 0 and t._id_animacion is None

@@ -179,7 +179,7 @@ bigdata_evaluacion2/
 ├── servidor_prueba.py     # servidor del Grupo 4 con dashboard, para comprobar que los datos llegan
 ├── requirements.txt       # dependencias para ejecutar (pandas, pyserial)
 ├── requirements-dev.txt   # + pytest, para las pruebas
-├── tests/                 # 116 pruebas: test_cliente, test_servidor, test_sensor, test_simulador
+├── tests/                 # 146 pruebas: test_cliente, test_servidor, test_sensor, test_simulador
 ├── docs/                  # informes y documentación detallada
 ├── MAESTRO.md             # documento maestro de la aplicación
 └── (tu CSV)               # no se sube a git
@@ -320,7 +320,7 @@ Aplica aunque sea un trabajo de ramo.
 
 `servidor_prueba.py` se escribió **sin importar `cliente.py`**, como lo haría otro grupo. Si los dos programas se entienden, el contrato está bien definido.
 
-| Qué | Pruebas del cliente CSV (`tests/test_cliente.py`; hoy son 45 y, con servidor, sensor y simulador, 116 en total) |
+| Qué | Pruebas del cliente CSV (`tests/test_cliente.py`; hoy son 45 y, con servidor, sensor y simulador, 146 en total) |
 |---|---|
 | Carga e informe | Cualquier CSV conserva sus columnas; conteo de vacíos y filas repetidas; archivos vacíos, sin filas o con columnas repetidas; archivo inexistente |
 | Informe | Conteo de vacíos y de filas repetidas |

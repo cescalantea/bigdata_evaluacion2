@@ -29,6 +29,39 @@ TASAS = {"1 dato por segundo": 1.0, "1 dato cada 2 segundos": 2.0, "1 dato cada 
 RANGOS = {"temperatura": (-40.0, 80.0), "humedad": (0.0, 100.0), "gas": (0.0, 1023.0)}
 CAMPOS = tuple(RANGOS)
 
+# --- Semáforo de niveles (solo para mostrar; no filtra ni modifica los datos que se envían) ---
+# Límites operativos y de medición del DHT11 según su hoja de datos. Fuera de ellos la lectura no
+# es confiable: rojo. Escala de cada barra del ecualizador = este rango.
+LIMITES_SENSOR = {"temperatura": (0.0, 50.0), "humedad": (20.0, 90.0), "gas": (0.0, 1023.0)}
+MARGEN_ALERTA = 0.10           # amarillo: el 10 % del rango más cercano a cada límite del DHT11
+# MQ-2: lectura analógica relativa (no son ppm). Umbrales de referencia, SIN calibrar con la placa.
+GAS_PRECAUCION = 300           # desde aquí, amarillo
+GAS_PELIGRO = 600              # desde aquí, rojo
+VERDE, AMARILLO, ROJO = "verde", "amarillo", "rojo"
+
+
+# Propósito: nivel del semáforo de un valor. Temperatura y humedad usan los límites del DHT11
+# (rojo fuera del rango, amarillo cerca de los bordes); el gas usa los umbrales de referencia.
+def nivel(campo, valor):
+    if campo == "gas":
+        return ROJO if valor >= GAS_PELIGRO else AMARILLO if valor >= GAS_PRECAUCION else VERDE
+    minimo, maximo = LIMITES_SENSOR[campo]
+    if not minimo <= valor <= maximo:
+        return ROJO
+    margen = (maximo - minimo) * MARGEN_ALERTA
+    return AMARILLO if valor < minimo + margen or valor > maximo - margen else VERDE
+
+
+# Propósito: rango que muestra la barra del ecualizador. Para temperatura y humedad son los límites del
+# DHT11 más un 10 % a cada lado, para que la zona roja de "fuera de rango" tenga espacio visible.
+# El gas usa su escala completa (0 a 1023).
+def escala(campo):
+    minimo, maximo = LIMITES_SENSOR[campo]
+    if campo == "gas":
+        return minimo, maximo
+    extra = (maximo - minimo) * MARGEN_ALERTA
+    return minimo - extra, maximo + extra
+
 
 class ErrorSensor(Exception):
     """No se pudo usar el puerto serie."""
