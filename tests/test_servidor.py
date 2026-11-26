@@ -2,8 +2,10 @@
 import gc
 import json
 import socket
+import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import pandas as pd
@@ -45,6 +47,126 @@ def test_fragmentacion_y_datos():
 def test_rechazos(datos):
     with pytest.raises((ValueError, UnicodeError)):
         recibir([datos])
+
+
+def test_puerto_sensores_reconstruye_json_lines_fragmentados():
+    mensajes = (
+        b'{"type":"SENSOR","timestamp":"2026-11-14T14:32:10",'
+        b'"temperature":23.8,"humidity":56.4,"gas":412}\n'
+        b'{"type":"SENSOR","temp":24.1,"hum":55.9,"gas":418}\n'
+    )
+    sensores = []
+    cantidad = s.recibir_sensores(
+        Fragmentos([bytes([byte]) for byte in mensajes]),
+        lambda mensaje, conexion: sensores.append(mensaje),
+    )
+    assert cantidad == 2
+    assert [m["gas"] for m in sensores] == [412, 418]
+
+
+def test_lectura_arduino_se_confirma_sin_guardarse_en_mongo(ventana):
+    class ConexionFalsa:
+        def __init__(self):
+            self.respuesta = b""
+
+        def settimeout(self, valor):
+            pass
+
+        def sendall(self, datos):
+            self.respuesta += datos
+
+    conexion = ConexionFalsa()
+    ventana._atender_sensor(
+        {"type": "SENSOR", "temp": 23.8, "hum": 56.4, "gas": 412},
+        conexion,
+    )
+
+    respuesta = json.loads(conexion.respuesta)
+    assert respuesta["ok"] is True
+    assert respuesta["persisted"] is False
+    assert respuesta["sensores"] == 1
+
+
+def test_mongo_guarda_las_columnas_csv_en_la_raiz(monkeypatch):
+    class ColeccionFalsa:
+        def __init__(self):
+            self.lotes = []
+
+        def insert_many(self, documentos, ordered):
+            self.lotes.append((documentos, ordered))
+
+    class BaseFalsa:
+        def __init__(self, coleccion):
+            self.coleccion = coleccion
+
+        def __getitem__(self, nombre):
+            assert nombre == "datos_csv"
+            return self.coleccion
+
+    monkeypatch.setenv("MONGODB_URI", "mongodb://localhost")
+    coleccion = ColeccionFalsa()
+    repo = s.MongoRepositorio()
+    repo._db = BaseFalsa(coleccion)
+    repo.tamano_lote = 2
+    monkeypatch.setattr(repo, "conectar", lambda: True)
+    dataframe = pd.DataFrame([
+        {"fecha": "2015-01-01", "caudal": 1.5},
+        {"fecha": "2015-01-02", "caudal": None},
+    ], dtype=object)
+
+    resultado = repo.guardar_dataframe(dataframe)
+
+    assert resultado["insertados"] == 2
+    assert [documento for lote, _ in coleccion.lotes for documento in lote] == [
+        {"fecha": "2015-01-01", "caudal": 1.5},
+        {"fecha": "2015-01-02", "caudal": None},
+    ]
+    assert all(ordered is False for _, ordered in coleccion.lotes)
+
+
+def test_mongo_reintenta_ping_con_espera(monkeypatch):
+    class ErrorMongo(Exception):
+        pass
+
+    class ClienteFalso:
+        def __init__(self, falla):
+            self.falla = falla
+            self.cerrado = False
+            self.admin = self
+
+        def command(self, comando):
+            assert comando == "ping"
+            if self.falla:
+                raise ErrorMongo("conexión caída")
+
+        def close(self):
+            self.cerrado = True
+
+        def __getitem__(self, nombre):
+            assert nombre == "bigdata_eval3"
+            return object()
+
+    instancias = [ClienteFalso(True), ClienteFalso(False)]
+    clientes = iter(instancias)
+    modulo = types.ModuleType("pymongo")
+    modulo.MongoClient = lambda *args, **kwargs: next(clientes)
+    errores = types.ModuleType("pymongo.errors")
+    errores.PyMongoError = ErrorMongo
+    modulo.errors = errores
+    monkeypatch.setitem(sys.modules, "pymongo", modulo)
+    monkeypatch.setitem(sys.modules, "pymongo.errors", errores)
+    monkeypatch.setenv("MONGODB_URI", "mongodb://localhost")
+    monkeypatch.setenv("MONGODB_MAX_ATTEMPTS", "2")
+    monkeypatch.setenv("MONGODB_RETRY_DELAY", "0.25")
+    esperas = []
+    monkeypatch.setattr(s.time, "sleep", esperas.append)
+    repo = s.MongoRepositorio()
+
+    assert repo.conectar() is True
+    assert esperas == [0.25]
+    assert instancias[0].cerrado is True
+    assert repo._cliente is not None
+    assert repo._db is not None
 
 
 def test_limite_y_cancelacion(monkeypatch):
@@ -114,7 +236,10 @@ def ventana():
 def iniciar(w):
     with socket.create_server(("127.0.0.1", 0)) as libre:
         puerto = libre.getsockname()[1]
+    with socket.create_server(("127.0.0.1", 0)) as libre:
+        puerto_sensores = libre.getsockname()[1]
     w.var_puerto.set(str(puerto))
+    w.var_puerto_sensores.set(str(puerto_sensores))
     w.iniciar()
     assert w.servidor is not None
     return puerto
@@ -164,6 +289,40 @@ def test_cliente_real_consecutivas_integridad(ventana):
         assert list(ventana.tabla["columns"]) == list(df.columns)
 
 
+def test_envio_csv_de_cliente_llega_al_repositorio_mongo(ventana):
+    class RepositorioFalso:
+        def __init__(self):
+            self.registros = None
+
+        def guardar_dataframe(self, dataframe):
+            self.registros = dataframe.to_dict("records")
+            return {
+                "habilitado": True,
+                "insertados": len(dataframe),
+                "transferencia_id": "transferencia-prueba",
+            }
+
+        def cerrar(self):
+            pass
+
+    repositorio = RepositorioFalso()
+    ventana.mongo = repositorio
+    puerto = iniciar(ventana)
+    registros = [
+        {"fecha": "2015-01-01", "estacion": "Río Ñuble", "caudal": 1.5},
+        {"fecha": "2015-01-02", "estacion": "Río Ñuble", "caudal": None},
+    ]
+    dataframe = pd.DataFrame(registros, dtype=object)
+
+    respuesta = terminar(
+        ventana,
+        en_hilo(lambda: EmisorTCP().enviar(dataframe, "127.0.0.1", puerto, 1)),
+    )
+
+    assert respuesta == {"ok": True, "filas": 2}
+    assert repositorio.registros == registros
+
+
 def test_ack_negativo_cliente_y_recuperacion(ventana):
     puerto = iniciar(ventana)
     for datos in [b'[{"a":1}]', b'[{"a":1}', b'bad<EOF>', b'{"a":[1]}<EOF>']:
@@ -200,17 +359,21 @@ def test_ack_negativo_cliente_y_recuperacion(ventana):
 
 def test_simultaneas_detencion_reinicio(ventana):
     puerto = iniciar(ventana)
+    puerto_sensores = int(ventana.var_puerto_sensores.get())
     c = socket.create_connection(("127.0.0.1", puerto), timeout=5)
     try:
         c.sendall(b'[{"a":')
         esperar(ventana, lambda: ventana._hilo_cliente is not None)
-        with socket.create_connection(("127.0.0.1", puerto), timeout=5) as segundo:
-            respuesta = json.loads(segundo.recv(4096))
-        assert not respuesta["ok"] and "ocupado" in respuesta["detalle"]
+        with socket.create_connection(("127.0.0.1", puerto_sensores), timeout=5) as sensor:
+            sensor.sendall(b'{"type":"SENSOR","temperature":23.8,"humidity":56.4,"gas":412}\n')
+            sensor.shutdown(socket.SHUT_WR)
+            respuesta = json.loads(sensor.recv(4096))
+        assert respuesta["ok"] and respuesta["type"] == "SENSOR_ACK"
         ventana.detener()
         esperar(ventana, lambda: ventana.servidor is None)
-        assert not ventana._hilo_cliente.is_alive()
+        assert not ventana._hilos_clientes
         assert not ventana._hilo_escucha.is_alive()
+        assert not ventana._hilo_escucha_sensores.is_alive()
         assert not json.loads(c.recv(4096))["ok"]
     finally:
         c.close()

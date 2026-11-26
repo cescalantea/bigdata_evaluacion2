@@ -1,6 +1,8 @@
-# Dependencias para ejecutar la aplicación (Python 3.10 o superior).
-# Instalar con:  pip install -r requirements.txt
-# Tkinter y socket vienen con Python; no se instalan con pip.
-
-pandas>=2.0        # lectura del CSV y armado de los lotes (cliente y servidor)
-pyserial>=3.5      # puerto serie del Arduino y conexión al simulador (socket://)
+pandas>=2.0
+pymongo>=4.6
+python-dotenv>=1.0
+matplotlib>=3.7
+mysql-connector-python>=8.0
+pytest>=8.0
+psycopg[binary]>=3.2,<4
+pyserial>=3.5 
